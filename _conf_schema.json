@@ -1,0 +1,13 @@
+{
+  "yuque_token": {"description": "语雀 Token", "type": "string"},
+  "yuque_base_url": {"description": "语雀 API 地址", "type": "string", "default": "https://www.yuque.com/api/v2"},
+  "yuque_repositories": {"description": "指定知识库：namespace 字符串或 {namespace,name} 对象数组", "type": "list", "default": []},
+  "embedding_api_key": {"description": "OpenAI-compatible Embedding API Key（可选）", "type": "string", "default": ""},
+  "embedding_base_url": {"description": "OpenAI-compatible Embedding API 根地址（可选）", "type": "string", "default": ""},
+  "embedding_model": {"description": "Embedding 模型", "type": "string", "default": "text-embedding-3-small"},
+  "wake_words": {"description": "唤醒词，逗号分隔", "type": "string", "default": "南大助手,南小答,nju"},
+  "enable_private_chat": {"description": "私聊响应", "type": "bool", "default": true},
+  "enable_group_at": {"description": "群聊 @ 或唤醒词响应", "type": "bool", "default": true},
+  "retrieval_top_k": {"description": "检索结果数", "type": "int", "default": 5},
+  "score_threshold": {"description": "检索分数阈值", "type": "float", "default": 0.25}
+}

@@ -1,0 +1,104 @@
+from __future__ import annotations
+import re
+from pathlib import Path
+from typing import Iterable
+import yaml
+from .models import Document
+
+
+class DocumentStore:
+    def __init__(self, root: Path):
+        self.root = root
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def safe_name(value: str) -> str:
+        value = (
+            re.sub(r"[\\/:*?\"<>|\x00-\x1f]+", "_", value)
+            .replace("..", "_")
+            .strip(" .")
+        )
+        return (value or "untitled")[:120]
+
+    def path_for(
+        self,
+        namespace: str,
+        parents: Iterable[str],
+        title: str,
+        doc_id: str,
+        used: set[Path],
+    ) -> Path:
+        base = self.root / self.safe_name(namespace)
+        for parent in parents:
+            base /= self.safe_name(parent)
+        base.mkdir(parents=True, exist_ok=True)
+        stem = self.safe_name(title)
+        candidate = base / f"{stem}.md"
+        suffix = 2
+        while (
+            candidate in used
+            or candidate.exists()
+            and not self._has_id(candidate, doc_id)
+        ):
+            candidate = base / f"{stem}_{suffix}.md"
+            suffix += 1
+        candidate.resolve().relative_to(self.root.resolve())
+        return candidate
+
+    def _has_id(self, path: Path, doc_id: str) -> bool:
+        try:
+            return str(self.read(path).yuque_id) == str(doc_id)
+        except (OSError, ValueError):
+            return False
+
+    def write(self, doc: Document) -> None:
+        if not doc.path:
+            raise ValueError("document path required")
+        doc.path.resolve().relative_to(self.root.resolve())
+        fm = {
+            "yuque_id": doc.yuque_id,
+            "title": doc.title,
+            "repository": doc.repository,
+            "namespace": doc.namespace,
+            "slug": doc.slug,
+            "url": doc.url,
+            "created_at": doc.created_at,
+            "updated_at": doc.updated_at,
+        }
+        doc.path.parent.mkdir(parents=True, exist_ok=True)
+        doc.path.write_text(
+            "---\n"
+            + yaml.safe_dump(fm, allow_unicode=True, sort_keys=False)
+            + "---\n\n"
+            + doc.body,
+            encoding="utf-8",
+        )
+
+    def read(self, path: Path) -> Document:
+        raw = path.read_text(encoding="utf-8")
+        if not raw.startswith("---\n"):
+            raise ValueError("missing frontmatter")
+        _, head, body = raw.split("---\n", 2)
+        fm = yaml.safe_load(head) or {}
+        required = (
+            "yuque_id",
+            "title",
+            "repository",
+            "namespace",
+            "slug",
+            "url",
+            "created_at",
+            "updated_at",
+        )
+        if any(k not in fm for k in required):
+            raise ValueError("incomplete frontmatter")
+        return Document(
+            **{k: str(fm[k]) for k in required}, body=body.lstrip("\n"), path=path
+        )
+
+    def remove(self, path: Path) -> None:
+        try:
+            path.resolve().relative_to(self.root.resolve())
+            path.unlink(missing_ok=True)
+        except ValueError:
+            raise ValueError("refusing to delete outside document root")

@@ -1,0 +1,1 @@
+"""NJU QA domain package."""
