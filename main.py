@@ -9,13 +9,14 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
-from nju_qa.answer_service import AnswerService
-from nju_qa.config import PluginConfig
-from nju_qa.document_index import DocumentIndex
-from nju_qa.document_store import DocumentStore
-from nju_qa.retriever import HybridRetriever
-from nju_qa.sync_service import SyncService
-from nju_qa.yuque_client import YuqueClient
+# AstrBot imports plugins as packages, so these must remain package-relative.
+from .nju_qa.answer_service import AnswerService
+from .nju_qa.config import PluginConfig
+from .nju_qa.document_index import DocumentIndex
+from .nju_qa.document_store import DocumentStore
+from .nju_qa.retriever import HybridRetriever
+from .nju_qa.sync_service import SyncService
+from .nju_qa.yuque_client import YuqueClient
 
 
 @register("astrbot_plugin_nju_qa", "peace", "南京大学知识库问答助手", "0.1.0")

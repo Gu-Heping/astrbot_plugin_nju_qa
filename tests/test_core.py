@@ -1,4 +1,5 @@
 import asyncio
+import ast
 from pathlib import Path
 import httpx
 import pytest
@@ -10,6 +11,15 @@ from nju_qa.models import Document
 from nju_qa.retriever import HybridRetriever
 from nju_qa.sync_service import SyncService
 from nju_qa.yuque_client import YuqueClient
+
+
+def test_main_uses_package_relative_imports():
+    module = ast.parse(Path("main.py").read_text(encoding="utf-8"))
+    imported = [node for node in ast.walk(module) if isinstance(node, ast.ImportFrom)]
+    package_imports = [
+        node for node in imported if (node.module or "").startswith("nju_qa")
+    ]
+    assert package_imports and all(node.level == 1 for node in package_imports)
 
 
 def doc(path: Path, ident="1", title="通知", body="南京大学考试安排"):
