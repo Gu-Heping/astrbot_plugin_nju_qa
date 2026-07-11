@@ -118,13 +118,12 @@ class NjuQaPlugin(Star):
     @filter.command("nju")
     async def nju(self, event: AstrMessageEvent, question: str = ""):
         mark_command_handled(event)
-        # Parse the raw message directly; AstrBot's command argument passing for
-        # subcommands is unreliable across versions.
+        # AstrBot strips the leading '/' from event.message_str for commands.
         text = (getattr(event, "message_str", None) or "").strip() or (
-            "/nju " + question
+            "nju " + question
         ).strip()
 
-        source_match = re.match(r"^/nju\s+source\s+(.+)$", text, re.IGNORECASE)
+        source_match = re.match(r"^nju\s+source\s+(.+)$", text, re.IGNORECASE)
         if source_match:
             keyword = source_match.group(1).strip()
             if not keyword:
@@ -135,7 +134,7 @@ class NjuQaPlugin(Star):
             )
             return
 
-        if re.match(r"^/nju(\s+help)?$", text, re.IGNORECASE):
+        if re.match(r"^nju(\s+help)?$", text, re.IGNORECASE):
             yield event.plain_result(
                 "/nju <问题>：查询知识库\n"
                 "/nju source <关键词>：查看来源\n"
@@ -145,8 +144,8 @@ class NjuQaPlugin(Star):
             )
             return
 
-        # Regular question: strip the /nju prefix.
-        query = re.sub(r"^/nju\s*", "", text, flags=re.IGNORECASE).strip()
+        # Regular question: strip the nju prefix.
+        query = re.sub(r"^nju\s*", "", text, flags=re.IGNORECASE).strip()
         yield event.plain_result("正在检索知识库并整理答案，请稍候...")
         yield event.plain_result(await self.agent.answer(event, query))
 
@@ -156,7 +155,7 @@ class NjuQaPlugin(Star):
         """Diagnostic command to inspect how AstrBot parses /nju messages."""
         mark_command_handled(event)
         text = (getattr(event, "message_str", None) or "").strip()
-        source_re = r"^/nju\s+source\s+"
+        source_re = r"^nju\s+source\s+"
         matched = bool(re.match(source_re, text, re.IGNORECASE))
         yield event.plain_result(
             f"message_str: {repr(text)}\n"
