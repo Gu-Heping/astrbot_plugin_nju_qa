@@ -53,6 +53,8 @@ def test_private_and_group_route_once_only_when_explicit():
     assert not router.route(Event("g"), "你好", False).should_handle
     assert router.route(Event("g"), "你好", True).query == "你好"
     assert router.route(Event("g"), "nju，你好", False).query == "你好"
+    # Private chat may report empty string instead of None for group_id.
+    assert router.route(Event(group_id=""), "你好", False).query == "你好"
 
 
 @dataclass

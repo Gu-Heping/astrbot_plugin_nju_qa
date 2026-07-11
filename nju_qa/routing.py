@@ -53,7 +53,7 @@ class MessageRouter:
         ):
             return RoutedMessage(False)
 
-        is_group = getattr(event, "get_group_id")() is not None
+        is_group = getattr(event, "get_group_id")() not in (None, "")
         if not is_group:
             return RoutedMessage(self.private_enabled, text)
         if not self.group_at_enabled:
