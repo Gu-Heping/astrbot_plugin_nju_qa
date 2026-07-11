@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .agent import SourceTracker
+from .doc_utils import clean_document_body
 from .models import ChunkResult
 from .retriever import HybridRetriever
 
@@ -32,6 +33,11 @@ async def search_knowledge_base(
     }
 
 
+def _clean_snippet(text: str) -> str:
+    """Remove Yuque HTML/markdown noise from short snippets."""
+    return clean_document_body(text[:2600])
+
+
 def _result_to_dict(chunk: ChunkResult | None, result) -> dict:
     if chunk is None:
         return {
@@ -39,7 +45,7 @@ def _result_to_dict(chunk: ChunkResult | None, result) -> dict:
             "title": result.document.title,
             "author": "",
             "book_name": result.document.repository,
-            "content_snippet": result.document.body[:2400],
+            "content_snippet": _clean_snippet(result.document.body),
             "file_path": str(result.document.path or ""),
             "yuque_id": result.document.yuque_id,
             "slug": result.document.slug,
@@ -56,7 +62,7 @@ def _result_to_dict(chunk: ChunkResult | None, result) -> dict:
         "title": chunk.title,
         "author": "",
         "book_name": result.document.repository,
-        "content_snippet": chunk.content_snippet[:2400],
+        "content_snippet": _clean_snippet(chunk.content_snippet),
         "file_path": chunk.file_path or str(result.document.path or ""),
         "yuque_id": result.document.yuque_id,
         "slug": chunk.slug or result.document.slug,

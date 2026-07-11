@@ -1,6 +1,7 @@
 """Chunk-level hybrid retriever combining vector and keyword signals."""
 
 from __future__ import annotations
+import asyncio
 import httpx
 from pathlib import Path
 from .config import PluginConfig
@@ -115,7 +116,7 @@ class HybridRetriever:
             results.append((cr, relevance))
         return results
 
-    def _keyword_candidates(
+    async def _keyword_candidates(
         self, query: str, top_k: int
     ) -> list[tuple[ChunkResult, float]]:
         if self.chunk_store is None:
@@ -286,8 +287,10 @@ class HybridRetriever:
         self._last_error = None
         if self.chunk_store is not None:
             self._rebuild_keyword_index()
-        vector_hits = await self._vector_candidates(query, self.config.retrieval_top_k)
-        keyword_hits = self._keyword_candidates(query, self.config.retrieval_top_k)
+        vector_hits, keyword_hits = await asyncio.gather(
+            self._vector_candidates(query, self.config.retrieval_top_k),
+            self._keyword_candidates(query, self.config.retrieval_top_k),
+        )
         merged = self._merge_candidates(vector_hits, keyword_hits)
         normalized = self._normalize(merged)
 

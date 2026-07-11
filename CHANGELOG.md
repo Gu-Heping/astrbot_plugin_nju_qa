@@ -16,12 +16,14 @@
 - 针对“详细整理/汇总/全面介绍”类问题，Agent 必须拆分为 2-4 个子主题分别检索，避免单次检索覆盖不全。
 - 引用来源限制为最多 5 条，减少答案被大量来源淹没的情况。
 - Grounding 材料来源上限从 5 提升到 7，优先保证事实性问题有足够依据。
+- 向量检索与关键词检索改为并发执行，降低 `search_knowledge_base` 的整体耗时。
 
 ### Fixed
 
 - 修复部分 AstrBot 实例只发出命令 handler 第一个 `yield` 导致最终答案丢失的问题；`/nju`、`/nju_grep`、`/nju_search` 等改为单次 yield 返回。
 - 修复 `read_doc` / `get_doc_details` 因数据库中 `path` 列已包含 `docs_root` 前缀而报 `invalid document path` 的问题，并统一 `DocumentStore` 后续写入使用相对 `docs_root` 的路径。
 - 修复 `grep_local_docs` 对长中文关键词无法命中时的兜底检索逻辑。
+- 修复 `search_knowledge_base` 返回片段和 `read_doc` / `get_doc_details` 正文中残留 Yuque HTML 标签、Markdown 图片、颜色字体等未清洗内容的问题。
 
 ## [0.1.0] - 2026-07-11
 

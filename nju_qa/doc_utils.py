@@ -20,7 +20,7 @@ def strip_meta_table(body: str) -> str:
     ).lstrip()
 
 
-def clean_document_body(body: str) -> str:
+def clean_document_body(body: str, *, preserve_paragraphs: bool = False) -> str:
     """Return a display-friendly version of a Markdown document body.
 
     Removes YAML frontmatter, leading metadata tables, markdown images and HTML
@@ -33,8 +33,18 @@ def clean_document_body(body: str) -> str:
     body = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", body)
     # Drop HTML tags (including Yuque font/color spans).
     body = re.sub(r"<[^>]+>", "", body)
-    # Normalize whitespace.
-    body = re.sub(r"\s+", " ", body).strip()
+    if preserve_paragraphs:
+        # Collapse horizontal whitespace inside each paragraph but keep paragraph
+        # breaks, so headings/lists remain readable for grounding.
+        paragraphs = [
+            re.sub(r"\s+", " ", paragraph).strip()
+            for paragraph in body.split("\n\n")
+            if paragraph.strip()
+        ]
+        body = "\n\n".join(paragraphs)
+    else:
+        # Normalize whitespace for short snippets / grep results.
+        body = re.sub(r"\s+", " ", body).strip()
     return body
 
 
@@ -68,7 +78,8 @@ def read_document_content(
     ):
         raise ValueError("invalid document path")
     metadata, body = parse_frontmatter(candidate.read_text(encoding="utf-8"))
-    body = strip_meta_table(body) if strip_metadata else body
+    if strip_metadata:
+        body = clean_document_body(body, preserve_paragraphs=True)
     chunk = body[offset : offset + limit]
     return {
         "metadata": metadata,
