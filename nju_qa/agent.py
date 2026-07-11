@@ -134,42 +134,50 @@ class NjuQaAgent:
         except Exception:
             return AGENT_ERROR
         text = str(getattr(response, "completion_text", "")).strip()
-        if (
-            requires_campus_evidence(prompt)
-            and not tracker.read_sources
-            and tracker.sources
-        ):
-            self._record_selected_documents(tracker)
-            response = await self._run_tool_loop(
-                event=event,
-                chat_provider_id=provider_id,
-                prompt=self._grounded_prompt(prompt, tracker),
-                system_prompt=AGENT_SYSTEM_PROMPT,
-                tracker=tracker,
-            )
-            text = str(getattr(response, "completion_text", "")).strip()
-        if requires_campus_evidence(prompt) and not tracker.read_sources:
+
+        if not requires_campus_evidence(prompt):
+            return append_verified_citations(text, tracker.sources, tracker.verified_urls)
+
+        # For campus-factual questions, require reliable sources.
+        reliable_sources = [s for s in tracker.sources if s.reliable]
+        if not reliable_sources:
+            return NO_EVIDENCE
+
+        # Ground the answer in the most relevant chunk snippets.
+        self._record_selected_documents(tracker)
+        response = await self._run_tool_loop(
+            event=event,
+            chat_provider_id=provider_id,
+            prompt=self._grounded_prompt(prompt, tracker),
+            system_prompt=AGENT_SYSTEM_PROMPT,
+            tracker=tracker,
+        )
+        text = str(getattr(response, "completion_text", "")).strip()
+        if not tracker.read_sources:
             return NO_EVIDENCE
         return append_verified_citations(text, tracker.sources, tracker.verified_urls)
 
     @staticmethod
     def _record_selected_documents(tracker: SourceTracker) -> None:
-        """Deterministic local read fallback after semantic search selected sources."""
+        """Use chunk snippets for grounding instead of full document bodies."""
         for source in tracker.sources[:3]:
             tracker.read_sources.add(
                 str(source.document.path or source.document.yuque_id)
             )
-            tracker.record_read_content(source.document.body)
+            if source.chunk is not None:
+                tracker.record_read_content(source.chunk.content_snippet)
+            else:
+                tracker.record_read_content(source.document.body)
 
     @staticmethod
     def _grounded_prompt(question: str, tracker: SourceTracker) -> str:
         materials = "\n\n".join(
-            f"[已读材料 {i}]《{source.document.title}》\n{source.document.body[:6000]}"
+            f"[已读材料 {i}]《{source.document.title}》\n{source.chunk.content_snippet[:6000] if source.chunk else source.document.body[:6000]}"
             for i, source in enumerate(tracker.sources[:3], 1)
         )
         return f"""请回答原问题：{question}
 
-只能根据以下已读的知识库正文作答；如果正文无法支持某一具体事项，请明确说没有可靠资料，绝不能补充一般经验、网站、流程或联系方式。不要自行输出链接或来源列表。
+只能根据以下已读的知识库正文作答。正文中没有提到的具体事项，必须明确说“知识库中暂未找到可靠资料”，绝不能补充一般经验、网站、流程或联系方式。不要自行输出链接或来源列表。
 
 {materials}"""
 

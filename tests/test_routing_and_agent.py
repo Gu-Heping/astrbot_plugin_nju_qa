@@ -34,7 +34,7 @@ def source() -> SearchResult:
         "通识课要求",
         Path("doc.md"),
     )
-    return SearchResult("S1", document, 1.0)
+    return SearchResult("S1", document, 1.0, reliable=True)
 
 
 def test_commands_never_enter_general_router():
