@@ -109,6 +109,8 @@ class HybridRetriever:
                 vector_relevance=relevance,
                 chunk_index=int(m.get("chunk_index", 0) or 0),
                 file_path=m.get("file_path", ""),
+                slug=m.get("slug", ""),
+                namespace=m.get("namespace", ""),
             )
             results.append((cr, relevance))
         return results
@@ -132,6 +134,8 @@ class HybridRetriever:
                 keyword_score=hit.score,
                 chunk_index=hit.chunk.chunk_index,
                 file_path=hit.chunk.file_path,
+                slug=hit.chunk.slug,
+                namespace=hit.chunk.namespace,
             )
             results.append((cr, hit.score))
         return results
@@ -267,6 +271,8 @@ class HybridRetriever:
                         reliable=current.reliable or next_item.reliable,
                         chunk_index=current.chunk_index,
                         file_path=current.file_path,
+                        slug=current.slug or next_item.slug,
+                        namespace=current.namespace or next_item.namespace,
                     )
                     current = combined
                     i += 1

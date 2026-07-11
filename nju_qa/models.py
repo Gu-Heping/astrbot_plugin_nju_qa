@@ -39,6 +39,8 @@ class ChunkResult:
     reliable: bool = False
     chunk_index: int = 0
     file_path: str = ""
+    slug: str = ""
+    namespace: str = ""
 
 
 @dataclass(frozen=True)

@@ -29,14 +29,22 @@ def read_document_content(
 ) -> dict:
     if offset < 0 or not 1 <= limit <= 20000:
         raise ValueError("invalid pagination")
-    candidate = (root / file_path).resolve()
+    root_resolved = root.resolve()
+    file_path_obj = Path(file_path)
+    if ".." in file_path_obj.parts:
+        raise ValueError("invalid document path")
+    # file_path may already include the root prefix (e.g. stored relative to cwd).
+    candidate = (root_resolved / file_path_obj).resolve()
+    if not candidate.is_relative_to(root_resolved):
+        alt = file_path_obj.resolve()
+        if alt.is_relative_to(root_resolved):
+            candidate = alt
     if (
-        ".." in Path(file_path).parts
-        or candidate.is_symlink()
+        candidate.is_symlink()
         or not candidate.is_file()
+        or not candidate.is_relative_to(root_resolved)
     ):
         raise ValueError("invalid document path")
-    candidate.relative_to(root.resolve())
     metadata, body = parse_frontmatter(candidate.read_text(encoding="utf-8"))
     body = strip_meta_table(body) if strip_metadata else body
     chunk = body[offset : offset + limit]

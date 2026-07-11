@@ -41,6 +41,18 @@ def test_read_doc_paginates_and_rejects_traversal(tmp_path):
         read_document_content(tmp_path, "../a.md")
 
 
+def test_read_doc_accepts_root_prefixed_path(tmp_path):
+    """file_path stored relative to cwd may include docs_root prefix."""
+    subdir = tmp_path / "repo"
+    subdir.mkdir()
+    (subdir / "doc.md").write_text(
+        "---\ntitle: t\n---\n\n正文。", encoding="utf-8"
+    )
+    # stored as cwd-relative path while docs_root is the subdir
+    result = read_document_content(subdir, str(tmp_path / "repo" / "doc.md"))
+    assert result["content"] == "正文。"
+
+
 def test_yuque_url_query_and_anchor_parse():
     assert parse_yuque_doc_url("https://www.yuque.com/nju/guide/freshman?x=1#part") == (
         "nju/guide",

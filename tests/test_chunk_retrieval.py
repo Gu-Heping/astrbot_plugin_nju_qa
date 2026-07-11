@@ -315,6 +315,8 @@ def test_chunk_result_fields_are_populated(indexed_corpus):
     assert isinstance(r.chunk.keyword_score, float)
     assert isinstance(r.chunk.final_score, float)
     assert r.chunk.retrieval_methods
+    assert r.chunk.slug
+    assert r.chunk.namespace == "nju/guide"
 
 
 def test_first_index_creates_multiple_chunks(tmp_path):
