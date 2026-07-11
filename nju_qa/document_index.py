@@ -111,11 +111,16 @@ class DocumentIndex:
         self.open()
         terms = self._terms(query)
         rows = self.all_documents()
-        ranked = [
-            (r, sum((r["title"] + " " + r["body"]).casefold().count(t) for t in terms))
-            for r in rows
-            if any(t in (r["title"] + r["body"]).casefold() for t in terms)
-        ]
+        ranked = []
+        for row in rows:
+            text = (row["title"] + " " + row["body"]).casefold()
+            title = row["title"].casefold()
+            matched = [term for term in terms if term in text]
+            if matched:
+                # Coverage is bounded: repeated boilerplate cannot saturate a score.
+                score = len(matched) / max(len(terms), 1)
+                score += 0.25 * sum(term in title for term in matched) / len(matched)
+                ranked.append((row, min(score, 1.0)))
         return sorted(ranked, key=lambda item: item[1], reverse=True)[:limit]
 
     @staticmethod

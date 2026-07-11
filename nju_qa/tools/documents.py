@@ -16,6 +16,7 @@ from ..doc_utils import (
 class _Tool(FunctionTool):
     index: Any = None
     docs_root: Any = None
+    tracker: Any = None
 
     async def call(self, context, **kwargs):
         return await self._run(**kwargs)
@@ -84,7 +85,11 @@ class ReadDocTool(_Tool):
     async def _run(
         self, file_path: str, offset: int = 0, limit: int = 12000, **_
     ) -> dict:
-        return read_document_content(self.docs_root, file_path, offset, limit)
+        result = read_document_content(self.docs_root, file_path, offset, limit)
+        if self.tracker:
+            self.tracker.read_sources.add(file_path)
+            self.tracker.record_read_content(result["content"])
+        return result
 
 
 @dataclass
@@ -166,11 +171,15 @@ class GetDocDetailsTool(_Tool):
         results = [doc_record_to_public_dict(row) for row in rows]
         if len(results) != 1 or not include_content:
             return {"count": len(results), "results": results}
-        return {
+        result = {
             "count": 1,
             "document": results[0],
             **read_document_content(self.docs_root, results[0]["path"], offset, limit),
         }
+        if self.tracker:
+            self.tracker.read_sources.add(results[0]["path"])
+            self.tracker.record_read_content(result["content"])
+        return result
 
 
 @dataclass

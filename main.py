@@ -50,14 +50,30 @@ class NjuQaPlugin(Star):
             self.context,
             lambda tracker: [
                 SearchKnowledgeBaseTool(retriever=self.retriever, tracker=tracker),
-                GrepLocalDocsTool(index=self.index, docs_root=self.store.root),
-                ReadDocTool(index=self.index, docs_root=self.store.root),
-                SearchDocsTool(index=self.index, docs_root=self.store.root),
-                GetDocDetailsTool(index=self.index, docs_root=self.store.root),
-                ParseYuqueUrlTool(index=self.index, docs_root=self.store.root),
-                ListKnowledgeBasesTool(index=self.index, docs_root=self.store.root),
-                ListRepoDocsTool(index=self.index, docs_root=self.store.root),
-                DocStatsTool(index=self.index, docs_root=self.store.root),
+                GrepLocalDocsTool(
+                    index=self.index, docs_root=self.store.root, tracker=tracker
+                ),
+                ReadDocTool(
+                    index=self.index, docs_root=self.store.root, tracker=tracker
+                ),
+                SearchDocsTool(
+                    index=self.index, docs_root=self.store.root, tracker=tracker
+                ),
+                GetDocDetailsTool(
+                    index=self.index, docs_root=self.store.root, tracker=tracker
+                ),
+                ParseYuqueUrlTool(
+                    index=self.index, docs_root=self.store.root, tracker=tracker
+                ),
+                ListKnowledgeBasesTool(
+                    index=self.index, docs_root=self.store.root, tracker=tracker
+                ),
+                ListRepoDocsTool(
+                    index=self.index, docs_root=self.store.root, tracker=tracker
+                ),
+                DocStatsTool(
+                    index=self.index, docs_root=self.store.root, tracker=tracker
+                ),
             ],
         )
         self.router = MessageRouter(

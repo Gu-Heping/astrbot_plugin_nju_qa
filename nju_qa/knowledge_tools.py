@@ -8,24 +8,41 @@ from .retriever import HybridRetriever
 
 async def search_knowledge_base(
     retriever: HybridRetriever, tracker: SourceTracker, query: str
-) -> str:
+) -> dict:
     """Search and record source evidence returned to the Agent."""
 
     if not retriever.index.all_documents():
-        return (
-            "知识库尚未同步；请提示用户联系管理员先执行 /nju_sync，不能编造校园事实。"
-        )
+        return {
+            "reliable": False,
+            "reason": "知识库尚未同步；请管理员先执行 /nju_sync。",
+            "candidates": [],
+        }
     results = await retriever.search(query)
     if not results:
-        return "知识库中暂未找到可靠答案；请明确告诉用户没有可靠资料，不要编造。"
+        return {
+            "reliable": False,
+            "reason": "知识库中暂未找到可靠答案。",
+            "candidates": [],
+        }
     tracker.add(results)
-    blocks = []
-    for result in results:
-        document = result.document
-        blocks.append(
-            f"[{result.source_id}]《{document.title}》\n"
-            f"更新时间：{document.updated_at}\n"
-            f"原文链接：{document.url}\n"
-            f"内容：{document.body[:3500]}"
-        )
-    return "\n\n".join(blocks)
+    return {
+        "reliable": True,
+        "candidates": [
+            {
+                "source_id": r.source_id,
+                "title": r.document.title,
+                "author": "",
+                "book_name": r.document.repository,
+                "content_snippet": r.document.body[:1200],
+                "file_path": str(r.document.path or ""),
+                "yuque_id": r.document.yuque_id,
+                "slug": r.document.slug,
+                "source_url": r.document.url,
+                "score": r.score,
+                "score_type": "combined_similarity",
+                "retrieval_method": "hybrid",
+                "reliable": True,
+            }
+            for r in results
+        ],
+    }

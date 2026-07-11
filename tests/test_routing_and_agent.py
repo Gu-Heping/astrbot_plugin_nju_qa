@@ -86,6 +86,7 @@ def test_normal_chat_uses_one_llm_call_without_forcing_search():
 def test_fact_answer_can_only_cite_tool_tracked_sources():
     async def loop(**kwargs):
         kwargs["tools"][0].tracker.add([source()])
+        kwargs["tools"][0].tracker.read_sources.add("doc.md")
         return Response(
             "通识课要求见资料：https://fake.test\n参考来源：\n1. 《伪造》：https://fake.test"
         )
@@ -117,6 +118,20 @@ def test_citations_are_deduplicated_from_actual_tool_results():
     assert len(tracker.sources) == 1
 
 
+def test_verified_website_url_from_read_document_is_preserved():
+    tracker = SourceTracker()
+    tracker.record_read_content("官方入口：https://portal.nju.edu.cn")
+    from nju_qa.agent import append_verified_citations
+
+    answer = append_verified_citations(
+        "请访问 https://portal.nju.edu.cn；不要访问 https://fake.test",
+        [],
+        tracker.verified_urls,
+    )
+    assert "https://portal.nju.edu.cn" in answer
+    assert "https://fake.test" not in answer
+
+
 class Index:
     def __init__(self, rows):
         self.rows = rows
@@ -142,11 +157,11 @@ def test_campus_question_searches_tool_and_returns_only_its_source():
     output = asyncio.run(search_knowledge_base(retriever, tracker, "通识课学分"))
     assert retriever.queries == ["通识课学分"]
     assert tracker.sources == [source()]
-    assert "https://yuque.test/doc" in output
+    assert output["candidates"][0]["source_url"] == "https://yuque.test/doc"
 
 
 def test_unsynced_knowledge_base_tells_user_to_contact_admin():
     output = asyncio.run(
         search_knowledge_base(Retriever([], rows=False), SourceTracker(), "校园卡")
     )
-    assert "/nju_sync" in output
+    assert "/nju_sync" in output["reason"]

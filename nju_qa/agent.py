@@ -19,9 +19,16 @@ class SourceTracker:
 
     def __init__(self) -> None:
         self.sources: list[SearchResult] = []
+        self.read_sources: set[str] = set()
+        self.verified_urls: set[str] = set()
 
     def reset(self) -> None:
         self.sources.clear()
+        self.read_sources.clear()
+        self.verified_urls.clear()
+
+    def record_read_content(self, content: str) -> None:
+        self.verified_urls.update(re.findall(r"https?://[^\s<>()，。；：]+", content))
 
     def add(self, results: list[SearchResult]) -> None:
         known = {item.document.yuque_id for item in self.sources}
@@ -31,16 +38,17 @@ class SourceTracker:
                 known.add(item.document.yuque_id)
 
 
-def append_verified_citations(text: str, sources: list[SearchResult]) -> str:
+def append_verified_citations(
+    text: str, sources: list[SearchResult], verified_urls: set[str] | None = None
+) -> str:
     """Drop a model-generated source section and render only tracked sources."""
 
     text = re.split(r"\n\s*(?:参考来源|来源)\s*[:：]", text, maxsplit=1)[0].strip()
     allowed_urls = {result.document.url for result in sources}
+    allowed_urls.update(verified_urls or set())
     text = re.sub(
-        r"https?://[^\s<>()]+",
-        lambda match: (
-            match.group(0) if match.group(0) in allowed_urls else "[未验证链接已移除]"
-        ),
+        r"https?://[^\s<>()，。；：]+",
+        lambda match: match.group(0) if match.group(0) in allowed_urls else "",
         text,
     )
     if not sources:
@@ -126,9 +134,9 @@ class NjuQaAgent:
         except Exception:
             return AGENT_ERROR
         text = str(getattr(response, "completion_text", "")).strip()
-        if requires_campus_evidence(prompt) and not tracker.sources:
+        if requires_campus_evidence(prompt) and not tracker.read_sources:
             return NO_EVIDENCE
-        return append_verified_citations(text, tracker.sources)
+        return append_verified_citations(text, tracker.sources, tracker.verified_urls)
 
     async def _run_tool_loop(
         self, *, tracker: SourceTracker, **kwargs: object
