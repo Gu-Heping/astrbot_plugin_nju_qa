@@ -72,11 +72,28 @@ def test_index_keyword_vector_and_answer_sources(tmp_path):
     index.open()
     d = doc(tmp_path / "a.md")
     index.upsert(d, [1.0, 0.0])
+    from nju_qa.chunk_store import ChunkStore
+    from nju_qa.chunking import split_markdown
+
+    chunk_store = ChunkStore(tmp_path / "chunks.sqlite3")
+    chunk_store.open()
+    chunks = split_markdown(
+        d.yuque_id,
+        d.body,
+        title=d.title,
+        repository=d.repository,
+        namespace=d.namespace,
+        slug=d.slug,
+        file_path=str(d.path),
+        source_url=d.url,
+        updated_at=d.updated_at,
+    )
+    chunk_store.save_document_chunks(d.yuque_id, chunks)
     config = PluginConfig.from_mapping(
         {"yuque_repositories": ["nju/guide"], "score_threshold": 0}
     )
     service = AnswerService(
-        HybridRetriever(index, config),
+        HybridRetriever(index, config, chunk_store=chunk_store),
         lambda prompt, system: asyncio.sleep(0, result="安排如下"),
     )
     result = asyncio.run(service.answer("考试安排"))
@@ -144,13 +161,37 @@ def test_sync_rename_move_delete_and_lock(tmp_path):
     )
     store = DocumentStore(tmp_path / "docs")
     index = DocumentIndex(tmp_path / "i.sqlite3")
+    from nju_qa.chunk_store import ChunkStore
+    from nju_qa.vector_index import ChunkVectorIndex
+
+    chunk_store = ChunkStore(tmp_path / "chunks.sqlite3")
+    vector_index = ChunkVectorIndex(
+        tmp_path / "vectors", model="mock", embedding_dimension=64
+    )
+    chunk_store.open()
     api = FakeYuque()
-    sync = SyncService(config, api, store, index)
+
+    async def embed(text):
+        return [0.1] * 64
+
+    sync = SyncService(
+        config,
+        api,
+        store,
+        index,
+        chunk_store=chunk_store,
+        vector_index=vector_index,
+        embed=embed,
+    )
     result = asyncio.run(sync.sync_all())
     assert result.succeeded == 1 and len(index.all_documents()) == 1
+    assert chunk_store.chunk_count() > 0
     api.title = "重命名通知"
     result = asyncio.run(sync.sync_all())
     assert result.succeeded == 1 and len(list((tmp_path / "docs").rglob("*.md"))) == 1
+    assert chunk_store.get_document_chunks("1")[0].title == "重命名通知"
     api.include_document = False
     result = asyncio.run(sync.sync_all())
     assert result.deleted == 1 and not index.all_documents()
+    assert chunk_store.chunk_count() == 0
+    assert vector_index.count() == 0

@@ -1,13 +1,21 @@
+"""Synchronizes Yuque documents into local Markdown files, SQLite metadata and chunk indexes."""
+
 from __future__ import annotations
 import asyncio
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
+from .chunk_indexer import ChunkIndexer
 from .config import PluginConfig
 from .document_index import DocumentIndex
 from .document_store import DocumentStore
 from .models import Document, SyncResult
 from .retriever import HybridRetriever
 from .yuque_client import YuqueClient
+
+
+def _body_hash(body: str) -> str:
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
 class SyncService:
@@ -17,19 +25,50 @@ class SyncService:
         client: YuqueClient,
         store: DocumentStore,
         index: DocumentIndex,
+        chunk_store=None,
+        vector_index=None,
+        embed=None,
     ):
-        self.config, self.client, self.store, self.index = config, client, store, index
+        self.config = config
+        self.client = client
+        self.store = store
+        self.index = index
+        self.chunk_store = chunk_store
+        self.vector_index = vector_index
+        self._custom_embed = embed
         self._sync_lock = asyncio.Lock()
         self._index_lock = asyncio.Lock()
         self.running = False
+        self._last_index_error: str | None = None
 
     def status_text(self) -> str:
         state = "进行中" if self.running else "空闲"
-        last = self.index.get_state("last_sync") or "从未"
+        last_sync = self.index.get_state("last_sync") or "从未"
+        last_index = self.index.get_state("last_index") or "从未"
+        last_index_result = self.index.get_state("last_index_result") or "无"
+        md_count = len(list(self.store.root.rglob("*.md")))
+        sqlite_count = self.index.document_count()
+        chunk_docs = (
+            self.chunk_store.documents_with_chunks() if self.chunk_store else 0
+        )
+        chunk_total = self.chunk_store.chunk_count() if self.chunk_store else 0
+        vector_count = self.vector_index.count() if self.vector_index else 0
+        embedding_ready = bool(
+            self.config.embedding_api_key and self.config.embedding_base_url
+        )
         return (
-            f"同步状态：{state}\n上次同步：{last}\nMarkdown 文档数：{len(list(self.store.root.rglob('*.md')))}"
-            f"\nSQLite 文档数：{self.index.document_count()}\n向量文档数：{self.index.vector_count()}"
-            f"\nEmbedding 已配置：{bool(self.config.embedding_api_key and self.config.embedding_base_url)}"
+            f"同步状态：{state}\n"
+            f"上次同步：{last_sync}\n"
+            f"最近索引：{last_index}\n"
+            f"最近索引结果：{last_index_result}\n"
+            f"Markdown 文档数：{md_count}\n"
+            f"SQLite 文档数：{sqlite_count}\n"
+            f"已建立 chunk 的文档数：{chunk_docs}\n"
+            f"chunk 总数：{chunk_total}\n"
+            f"已向量化 chunk 数：{vector_count}\n"
+            f"Embedding 可用：{embedding_ready}\n"
+            f"Embedding 模型：{self.config.embedding_model}\n"
+            f"索引失败：{self._last_index_error or '无'}"
         )
 
     async def sync_all(self) -> SyncResult:
@@ -44,10 +83,17 @@ class SyncService:
                 for repo in self.config.repositories:
                     await self._sync_repository(repo.namespace, repo.name, result)
                 async with self._index_lock:
-                    await self._rebuild_embeddings()
+                    index_result = await self._index_changed_documents(result)
                 self.index.set_state(
                     "last_sync", datetime.now(timezone.utc).isoformat()
                 )
+                self.index.set_state(
+                    "last_index",
+                    datetime.now(timezone.utc).isoformat(),
+                )
+                self.index.set_state("last_index_result", str(index_result))
+                result.chunks_indexed = index_result.get("chunks", 0)
+                result.chunks_failed = index_result.get("failed_documents", 0)
                 return result
             finally:
                 self.running = False
@@ -78,8 +124,6 @@ class SyncService:
                     (r for r in self.index.all_documents() if r["yuque_id"] == doc_id),
                     None,
                 )
-                # Recompute this on every run so TOC moves and title renames are
-                # reflected locally while the stable Yuque ID preserves identity.
                 path = self.store.path_for(namespace, parents, title, doc_id, used)
                 used.add(path)
                 url = str(
@@ -101,12 +145,79 @@ class SyncService:
                     self.store.remove(Path(existing["path"]))
                 self.store.write(doc)
                 self.index.upsert(doc)
+                # Metadata-only updates for renamed or moved documents.
+                if existing and self.chunk_store is not None:
+                    if existing["title"] != title or existing["path"] != str(path):
+                        self.chunk_store.update_document_metadata(
+                            doc_id,
+                            title=title,
+                            repository=doc.repository,
+                            namespace=namespace,
+                            slug=doc.slug,
+                            file_path=str(path),
+                            source_url=url,
+                            updated_at=doc.updated_at,
+                        )
                 result.succeeded += 1
             except Exception:
                 result.failed += 1
         for row in self.index.delete_missing(namespace, seen):
             self.store.remove(Path(row["path"]))
+            if self.chunk_store is not None:
+                self.chunk_store.delete_document(row["yuque_id"])
+            if self.vector_index is not None:
+                self.vector_index.delete_document(row["yuque_id"])
             result.deleted += 1
+
+    async def _index_changed_documents(self, result: SyncResult) -> dict:
+        """Index chunks for new or updated documents; skip unchanged bodies."""
+        if self.chunk_store is None or self.vector_index is None:
+            return {"chunks": 0, "failed_documents": 0}
+        indexer = ChunkIndexer(
+            self.chunk_store,
+            self.vector_index,
+            self._embed,
+            chunk_size=self.config.chunk_size,
+            overlap=self.config.chunk_overlap,
+        )
+        total = failed = 0
+        errors: list[str] = []
+        for row in self.index.all_documents():
+            doc_id = str(row["yuque_id"])
+            new_hash = _body_hash(row["body"])
+            existing = self.chunk_store.get_document_chunks(doc_id)
+            if existing and all(c.content_hash == new_hash for c in existing):
+                # Body unchanged; still make sure metadata is current.
+                self.chunk_store.update_document_metadata(
+                    doc_id,
+                    title=row["title"],
+                    repository=row["repository"],
+                    namespace=row["namespace"],
+                    slug=row["slug"],
+                    file_path=row["path"] or "",
+                    source_url=row["url"],
+                    updated_at=row["updated_at"],
+                )
+                continue
+            res = await indexer.index_document(row)
+            total += res["chunks"]
+            if res["error"]:
+                failed += 1
+                errors.append(f"{doc_id}: {res['error']}")
+        if errors:
+            self._last_index_error = "; ".join(errors[:5])
+        return {"chunks": total, "failed_documents": failed, "errors": errors}
+
+    async def _embed(self, text: str) -> list[float] | None:
+        if self._custom_embed is not None:
+            try:
+                return await self._custom_embed(text)
+            except Exception as exc:
+                self._last_index_error = f"embedding failed: {type(exc).__name__}"
+                return None
+        if not self.config.embedding_api_key or not self.config.embedding_base_url:
+            return None
+        return await HybridRetriever(self.index, self.config).embed_text(text)
 
     def _toc_paths(self, toc, by_uuid):
         output = {}
@@ -125,12 +236,30 @@ class SyncService:
         return output
 
     async def rebuild_index(self) -> str:
-        # Acquire both locks in the same order as sync: a rebuild must never
-        # read/write embeddings while synchronization is changing documents.
         async with self._sync_lock:
             async with self._index_lock:
-                count = await self._rebuild_embeddings()
-        return f"向量索引重建完成：{count} 篇文档。"
+                from .chunk_indexer import ChunkIndexer
 
-    async def _rebuild_embeddings(self) -> int:
-        return await HybridRetriever(self.index, self.config).rebuild_embeddings()
+                indexer = ChunkIndexer(
+                    self.chunk_store,
+                    self.vector_index,
+                    self._embed,
+                    chunk_size=self.config.chunk_size,
+                    overlap=self.config.chunk_overlap,
+                )
+                result = await indexer.rebuild(self.index.all_documents())
+                self._last_index_error = (
+                    "; ".join(result.get("errors", [])) or None
+                )
+                self.index.set_state(
+                    "last_index",
+                    datetime.now(timezone.utc).isoformat(),
+                )
+                self.index.set_state(
+                    "last_index_result",
+                    f"chunks={result['chunks']} failed_docs={result['failed_documents']}",
+                )
+        return (
+            f"向量索引重建完成：{result['chunks']} 个 chunk，"
+            f"失败文档 {result['failed_documents']}。"
+        )

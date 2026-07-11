@@ -256,13 +256,17 @@ class ListRepoDocsTool(_Tool):
 @dataclass
 class DocStatsTool(_Tool):
     name: str = "doc_stats"
-    description: str = "返回本地文档和向量索引数量。"
+    description: str = "返回本地文档、chunk 和向量索引数量。"
     parameters: dict = field(
         default_factory=lambda: {"type": "object", "properties": {}}
     )
 
     async def _run(self, **_) -> dict:
-        return {
+        result = {
             "sqlite_documents": self.index.document_count(),
             "vector_documents": self.index.vector_count(),
         }
+        if hasattr(self, "chunk_store") and self.chunk_store is not None:
+            result["chunk_documents"] = self.chunk_store.documents_with_chunks()
+            result["chunk_total"] = self.chunk_store.chunk_count()
+        return result
