@@ -122,14 +122,20 @@ class NjuQaPlugin(Star):
                 "/nju <问题>：查询知识库\n"
                 "/nju source <关键词>：查看来源\n"
                 "/nju_grep <关键词>：全文搜索本地文档\n"
+                "/nju_sync / /nju_index / /nju_search：管理员命令\n"
                 "本项目为非官方开源项目，与南京大学官方无隶属或授权关系。"
             )
             return
         if question.strip().lower().startswith("source "):
+            keyword = question.strip()[7:].strip()
+            if not keyword:
+                yield event.plain_result("用法：/nju source <关键词>")
+                return
             yield event.plain_result(
-                self._format_sources(await self.retriever.search(question.strip()[7:]))
+                self._format_sources(await self.retriever.search(keyword))
             )
             return
+        yield event.plain_result("正在检索知识库并整理答案，请稍候...")
         yield event.plain_result(await self.agent.answer(event, question))
 
     @filter.command("nju_grep")
@@ -202,6 +208,10 @@ class NjuQaPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def nju_search(self, event: AstrMessageEvent, query: str = ""):
         mark_command_handled(event)
+        if not query.strip():
+            yield event.plain_result("用法：/nju_search <查询词>")
+            return
+        yield event.plain_result("正在执行检索调试，请稍候...")
         yield event.plain_result(
             self.retriever.debug_text(await self.retriever.debug_search(query))
         )

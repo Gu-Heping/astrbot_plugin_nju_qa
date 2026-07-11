@@ -6,6 +6,7 @@ from typing import Any
 from astrbot.api import FunctionTool
 from astrbot.api.event import AstrMessageEvent
 from ..doc_utils import (
+    clean_document_body,
     doc_record_to_public_dict,
     parse_yuque_doc_url,
     read_document_content,
@@ -51,7 +52,7 @@ class GrepLocalDocsTool(_Tool):
                 and repo_filter.casefold() not in row["repository"].casefold()
             ):
                 continue
-            text = row["title"] + "\n" + row["body"]
+            text = clean_document_body(row["title"] + "\n" + row["body"])
             found = [x for x in terms if x.casefold() in text.casefold()]
             if found:
                 pos = min(text.casefold().find(x.casefold()) for x in found)

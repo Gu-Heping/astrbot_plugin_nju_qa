@@ -20,6 +20,24 @@ def strip_meta_table(body: str) -> str:
     ).lstrip()
 
 
+def clean_document_body(body: str) -> str:
+    """Return a display-friendly version of a Markdown document body.
+
+    Removes YAML frontmatter, leading metadata tables, markdown images and HTML
+    tags, while preserving link text and URLs.
+    """
+    body = strip_meta_table(parse_frontmatter(body)[1])
+    # Drop markdown images entirely.
+    body = re.sub(r"!\[.*?\]\(.*?\)", "", body)
+    # Keep both link text and URL.
+    body = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", body)
+    # Drop HTML tags (including Yuque font/color spans).
+    body = re.sub(r"<[^>]+>", "", body)
+    # Normalize whitespace.
+    body = re.sub(r"\s+", " ", body).strip()
+    return body
+
+
 def read_document_content(
     root: Path,
     file_path: str,
