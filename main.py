@@ -101,6 +101,7 @@ class NjuQaPlugin(Star):
             self.config.enable_group_at,
         )
         self._sync_task: asyncio.Task | None = None
+        self._rebuild_task: asyncio.Task | None = None
 
     async def initialize(self):
         self.index.open()
@@ -109,6 +110,9 @@ class NjuQaPlugin(Star):
     async def _sync(self) -> str:
         result = await self.syncer.sync_all()
         return result.summary()
+
+    async def _rebuild(self) -> str:
+        return await self.syncer.rebuild_index()
 
     @filter.command("nju")
     async def nju(self, event: AstrMessageEvent, question: str = ""):
@@ -147,7 +151,20 @@ class NjuQaPlugin(Star):
         if action.lower() != "rebuild":
             yield event.plain_result("用法：/nju_index rebuild")
             return
-        yield event.plain_result(await self.syncer.rebuild_index())
+        if self._rebuild_task is not None and not self._rebuild_task.done():
+            yield event.plain_result(
+                "索引重建正在进行中；请使用 /nju_sync status 查看状态。"
+            )
+            return
+        yield event.plain_result("开始重建 chunk store 与向量索引，请稍候...")
+        self._rebuild_task = asyncio.create_task(self._rebuild())
+        try:
+            result = await self._rebuild_task
+        except Exception as exc:
+            logger.exception("Rebuild index failed")
+            yield event.plain_result(f"重建索引失败：{exc}")
+            return
+        yield event.plain_result(result)
 
     @filter.command("nju_search")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -212,6 +229,9 @@ class NjuQaPlugin(Star):
         if self._sync_task and not self._sync_task.done():
             self._sync_task.cancel()
             await asyncio.gather(self._sync_task, return_exceptions=True)
+        if self._rebuild_task and not self._rebuild_task.done():
+            self._rebuild_task.cancel()
+            await asyncio.gather(self._rebuild_task, return_exceptions=True)
         await self.client.close()
         self.index.close()
         self.chunk_store.close()
