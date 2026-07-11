@@ -117,7 +117,18 @@ class NjuQaPlugin(Star):
     @filter.command("nju")
     async def nju(self, event: AstrMessageEvent, question: str = ""):
         mark_command_handled(event)
-        if question.strip().lower() == "help" or not question.strip():
+        # Parse the raw message so subcommand handling is independent of how
+        # AstrBot passes the handler argument.
+        text = (getattr(event, "message_str", None) or "").strip()
+        rest = ""
+        if text.lower().startswith("/nju "):
+            rest = text[5:].strip()
+        elif text.lower() == "/nju":
+            rest = ""
+        else:
+            rest = question.strip()
+
+        if rest.lower() == "help" or not rest:
             yield event.plain_result(
                 "/nju <问题>：查询知识库\n"
                 "/nju source <关键词>：查看来源\n"
@@ -126,8 +137,8 @@ class NjuQaPlugin(Star):
                 "本项目为非官方开源项目，与南京大学官方无隶属或授权关系。"
             )
             return
-        if question.strip().lower().startswith("source "):
-            keyword = question.strip()[7:].strip()
+        if rest.lower().startswith("source "):
+            keyword = rest[7:].strip()
             if not keyword:
                 yield event.plain_result("用法：/nju source <关键词>")
                 return
@@ -136,7 +147,7 @@ class NjuQaPlugin(Star):
             )
             return
         yield event.plain_result("正在检索知识库并整理答案，请稍候...")
-        yield event.plain_result(await self.agent.answer(event, question))
+        yield event.plain_result(await self.agent.answer(event, rest))
 
     @filter.command("nju_grep")
     async def nju_grep(self, event: AstrMessageEvent, keywords: str = ""):
