@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 
 from astrbot.api import logger
@@ -117,18 +118,24 @@ class NjuQaPlugin(Star):
     @filter.command("nju")
     async def nju(self, event: AstrMessageEvent, question: str = ""):
         mark_command_handled(event)
-        # Parse the raw message so subcommand handling is independent of how
-        # AstrBot passes the handler argument.
-        text = (getattr(event, "message_str", None) or "").strip()
-        rest = ""
-        if text.lower().startswith("/nju "):
-            rest = text[5:].strip()
-        elif text.lower() == "/nju":
-            rest = ""
-        else:
-            rest = question.strip()
+        # Parse the raw message directly; AstrBot's command argument passing for
+        # subcommands is unreliable across versions.
+        text = (getattr(event, "message_str", None) or "").strip() or (
+            "/nju " + question
+        ).strip()
 
-        if rest.lower() == "help" or not rest:
+        source_match = re.match(r"^/nju\s+source\s+(.+)$", text, re.IGNORECASE)
+        if source_match:
+            keyword = source_match.group(1).strip()
+            if not keyword:
+                yield event.plain_result("用法：/nju source <关键词>")
+                return
+            yield event.plain_result(
+                self._format_sources(await self.retriever.search(keyword))
+            )
+            return
+
+        if re.match(r"^/nju(\s+help)?$", text, re.IGNORECASE):
             yield event.plain_result(
                 "/nju <问题>：查询知识库\n"
                 "/nju source <关键词>：查看来源\n"
@@ -137,17 +144,11 @@ class NjuQaPlugin(Star):
                 "本项目为非官方开源项目，与南京大学官方无隶属或授权关系。"
             )
             return
-        if rest.lower().startswith("source "):
-            keyword = rest[7:].strip()
-            if not keyword:
-                yield event.plain_result("用法：/nju source <关键词>")
-                return
-            yield event.plain_result(
-                self._format_sources(await self.retriever.search(keyword))
-            )
-            return
+
+        # Regular question: strip the /nju prefix.
+        query = re.sub(r"^/nju\s*", "", text, flags=re.IGNORECASE).strip()
         yield event.plain_result("正在检索知识库并整理答案，请稍候...")
-        yield event.plain_result(await self.agent.answer(event, rest))
+        yield event.plain_result(await self.agent.answer(event, query))
 
     @filter.command("nju_grep")
     async def nju_grep(self, event: AstrMessageEvent, keywords: str = ""):
