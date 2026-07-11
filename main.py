@@ -93,6 +93,7 @@ class NjuQaPlugin(Star):
                     index=self.index, docs_root=self.store.root, tracker=tracker
                 ),
             ],
+            docs_root=self.store.root,
         )
         self.router = MessageRouter(
             self.config.wake_words,
