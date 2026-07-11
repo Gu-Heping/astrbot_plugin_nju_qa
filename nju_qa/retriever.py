@@ -305,15 +305,28 @@ class HybridRetriever:
                 }
             )
 
-        sorted_items = sorted(
-            normalized.values(), key=lambda x: x.final_score, reverse=True
-        )
-        max_per_doc = max(2, self.config.retrieval_top_k // 2)
-        limited = self._limit_same_document(sorted_items, max_per_doc)
-        merged_adjacent = self._merge_adjacent_chunks(limited)
-        selected = [
-            item for item in merged_adjacent if item.final_score >= threshold
-        ][: self.config.retrieval_top_k]
+        selected = self._select_from_normalized(normalized, threshold)
+
+        # Fallback: if the hybrid pipeline drops everything, trust pure keyword hits.
+        # Keyword hits already have title/path/phrase boosts applied.
+        if not selected and keyword_hits:
+            fallback: dict[str, ChunkResult] = {}
+            fallback_threshold = threshold * 0.5
+            for cr, score in keyword_hits:
+                if cr.chunk_id in fallback:
+                    continue
+                fallback[cr.chunk_id] = ChunkResult(
+                    **{
+                        **cr.__dict__,
+                        "keyword_score": score,
+                        "final_score": score,
+                        "retrieval_methods": tuple(
+                            dict.fromkeys([*cr.retrieval_methods, "keyword"])
+                        ),
+                        "reliable": score >= fallback_threshold,
+                    }
+                )
+            selected = self._select_from_normalized(fallback, fallback_threshold)
 
         lookup = {r["yuque_id"]: r for r in self.index.all_documents()}
         search_results = []
@@ -351,6 +364,19 @@ class HybridRetriever:
             "vector_count": self.vector_index.count() if self.vector_index else 0,
             "last_error": self._last_error,
         }
+
+    def _select_from_normalized(
+        self, normalized: dict[str, ChunkResult], threshold: float
+    ) -> list[ChunkResult]:
+        sorted_items = sorted(
+            normalized.values(), key=lambda x: x.final_score, reverse=True
+        )
+        max_per_doc = max(2, self.config.retrieval_top_k // 2)
+        limited = self._limit_same_document(sorted_items, max_per_doc)
+        merged_adjacent = self._merge_adjacent_chunks(limited)
+        return [
+            item for item in merged_adjacent if item.final_score >= threshold
+        ][: self.config.retrieval_top_k]
 
     async def search(self, query: str) -> list[SearchResult]:
         report = await self.debug_search(query)

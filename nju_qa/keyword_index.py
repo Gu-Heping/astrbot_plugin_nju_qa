@@ -72,6 +72,7 @@ class _Posting:
     chunk_id: str
     term_frequency: int
     title_hits: int
+    path_hits: int
     positions: list[int]
 
 
@@ -107,10 +108,12 @@ class ChunkKeywordIndex:
             self._chunks[chunk.chunk_id] = chunk
             title_tokens = _tokenize(chunk.title)
             body_tokens = _tokenize(chunk.content)
-            positions = body_tokens + title_tokens
+            path_tokens = _tokenize(chunk.file_path)
+            positions = body_tokens + title_tokens + path_tokens
             # title tokens are appended after body tokens for positional phrase scoring.
             term_counts: Counter[str] = Counter(positions)
             title_counter: Counter[str] = Counter(title_tokens)
+            path_counter: Counter[str] = Counter(path_tokens)
             length = len(body_tokens)
             total_len += max(length, 1)
             for term, freq in term_counts.items():
@@ -118,6 +121,7 @@ class ChunkKeywordIndex:
                     chunk_id=chunk.chunk_id,
                     term_frequency=freq,
                     title_hits=title_counter.get(term, 0),
+                    path_hits=path_counter.get(term, 0),
                     positions=[i for i, t in enumerate(positions) if t == term],
                 )
                 self._index.setdefault(term, []).append(posting)
@@ -144,6 +148,7 @@ class ChunkKeywordIndex:
         chunk_scores: dict[str, float] = {}
         chunk_terms: dict[str, set[str]] = {chunk_id: set() for chunk_id in self._chunks}
         chunk_title_hits: dict[str, int] = {}
+        chunk_path_hits: dict[str, int] = {}
         chunk_phrase_hits: dict[str, int] = {}
 
         for term in terms:
@@ -156,19 +161,24 @@ class ChunkKeywordIndex:
                 if denom <= 0:
                     continue
                 bm25 = idf[term] * (posting.term_frequency * (self.k1 + 1)) / denom
-                # Title boost: each title hit adds extra score.
+                # Title boost: title hits are strong signals; give them a large bonus.
                 title_boost = 0.0
                 if posting.title_hits:
-                    title_boost = idf[term] * posting.title_hits * 0.5
-                chunk_scores[chunk.chunk_id] = chunk_scores.get(chunk.chunk_id, 0.0) + bm25 + title_boost
+                    title_boost = idf[term] * posting.title_hits * 2.0
+                # Path boost: file path often contains categorization keywords.
+                path_boost = 0.0
+                if posting.path_hits:
+                    path_boost = idf[term] * posting.path_hits * 1.0
+                chunk_scores[chunk.chunk_id] = chunk_scores.get(chunk.chunk_id, 0.0) + bm25 + title_boost + path_boost
                 chunk_terms[chunk.chunk_id].add(term)
                 chunk_title_hits[chunk.chunk_id] = chunk_title_hits.get(chunk.chunk_id, 0) + posting.title_hits
+                chunk_path_hits[chunk.chunk_id] = chunk_path_hits.get(chunk.chunk_id, 0) + posting.path_hits
 
         # Phrase bonus: consecutive query terms appear in order in the chunk.
         if len(terms) > 1:
             for chunk_id, chunk in self._chunks.items():
                 positions_all: list[tuple[int, str]] = []
-                tokens = _tokenize(chunk.title + " " + chunk.content)
+                tokens = _tokenize(chunk.title + " " + chunk.content + " " + chunk.file_path)
                 for i, t in enumerate(tokens):
                     if t in terms:
                         positions_all.append((i, t))
@@ -182,8 +192,8 @@ class ChunkKeywordIndex:
         normalized: dict[str, float] = {}
         for chunk_id, raw in chunk_scores.items():
             coverage = len(chunk_terms[chunk_id]) / len(terms)
-            coverage_bonus = coverage * 0.2 * raw if max_score > 0 else 0.0
-            phrase_bonus = chunk_phrase_hits.get(chunk_id, 0) * 0.1 * raw if max_score > 0 else 0.0
+            coverage_bonus = coverage * 0.3 * raw if max_score > 0 else 0.0
+            phrase_bonus = chunk_phrase_hits.get(chunk_id, 0) * 0.2 * raw if max_score > 0 else 0.0
             normalized[chunk_id] = raw + coverage_bonus + phrase_bonus
 
         max_norm = max(normalized.values()) if normalized else 0.0

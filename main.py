@@ -119,7 +119,10 @@ class NjuQaPlugin(Star):
         mark_command_handled(event)
         if question.strip().lower() == "help" or not question.strip():
             yield event.plain_result(
-                "/nju <问题>：查询知识库\n/nju source <关键词>：查看来源\n本项目为非官方开源项目，与南京大学官方无隶属或授权关系。"
+                "/nju <问题>：查询知识库\n"
+                "/nju source <关键词>：查看来源\n"
+                "/nju_grep <关键词>：全文搜索本地文档\n"
+                "本项目为非官方开源项目，与南京大学官方无隶属或授权关系。"
             )
             return
         if question.strip().lower().startswith("source "):
@@ -128,6 +131,25 @@ class NjuQaPlugin(Star):
             )
             return
         yield event.plain_result(await self.agent.answer(event, question))
+
+    @filter.command("nju_grep")
+    async def nju_grep(self, event: AstrMessageEvent, keywords: str = ""):
+        mark_command_handled(event)
+        if not keywords.strip():
+            yield event.plain_result("用法：/nju_grep <空格分隔的关键词>")
+            return
+        tool = GrepLocalDocsTool(index=self.index, docs_root=self.store.root)
+        result = await tool._run(keywords)
+        if not result.get("results"):
+            yield event.plain_result("本地文档中未找到匹配内容。")
+            return
+        lines = [f"共找到 {result['count']} 条："]
+        for i, hit in enumerate(result["results"][:10], 1):
+            snippet = hit.get("snippet", "").replace("\n", " ")[:200]
+            lines.append(
+                f"{i}. 《{hit.get('title')}》：{hit.get('source_url')}\n   {snippet}..."
+            )
+        yield event.plain_result("\n".join(lines))
 
     @filter.command("nju_sync")
     @filter.permission_type(filter.PermissionType.ADMIN)
