@@ -10,12 +10,14 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
 # AstrBot imports plugins as packages, so these must remain package-relative.
-from .nju_qa.answer_service import AnswerService
+from .nju_qa.agent import NjuQaAgent
 from .nju_qa.config import PluginConfig
 from .nju_qa.document_index import DocumentIndex
 from .nju_qa.document_store import DocumentStore
 from .nju_qa.retriever import HybridRetriever
+from .nju_qa.routing import MessageRouter, mark_command_handled
 from .nju_qa.sync_service import SyncService
+from .nju_qa.tools import SearchKnowledgeBaseTool
 from .nju_qa.yuque_client import YuqueClient
 
 
@@ -33,20 +35,22 @@ class NjuQaPlugin(Star):
         self.index = DocumentIndex(data_dir / "nju_qa.sqlite3")
         self.client = YuqueClient(self.config.yuque_token, self.config.yuque_base_url)
         self.syncer = SyncService(self.config, self.client, self.store, self.index)
-        self.answers = AnswerService(
-            HybridRetriever(self.index, self.config), self._call_llm
+        self.retriever = HybridRetriever(self.index, self.config)
+        self.agent = NjuQaAgent(
+            self.context,
+            lambda tracker: [
+                SearchKnowledgeBaseTool(retriever=self.retriever, tracker=tracker)
+            ],
+        )
+        self.router = MessageRouter(
+            self.config.wake_words,
+            self.config.enable_private_chat,
+            self.config.enable_group_at,
         )
         self._sync_task: asyncio.Task | None = None
 
     async def initialize(self):
         self.index.open()
-
-    async def _call_llm(self, prompt: str, system_prompt: str) -> str:
-        provider = self.context.get_using_provider()
-        response = await provider.text_chat(
-            prompt=prompt, context=[], system_prompt=system_prompt
-        )
-        return response.completion_text.strip()
 
     async def _sync(self) -> str:
         result = await self.syncer.sync_all()
@@ -54,6 +58,7 @@ class NjuQaPlugin(Star):
 
     @filter.command("nju")
     async def nju(self, event: AstrMessageEvent, question: str = ""):
+        mark_command_handled(event)
         if question.strip().lower() == "help" or not question.strip():
             yield event.plain_result(
                 "/nju <问题>：查询知识库\n/nju source <关键词>：查看来源\n本项目为非官方开源项目，与南京大学官方无隶属或授权关系。"
@@ -61,16 +66,15 @@ class NjuQaPlugin(Star):
             return
         if question.strip().lower().startswith("source "):
             yield event.plain_result(
-                self.answers.format_source_results(
-                    await self.answers.source_results(question.strip()[7:])
-                )
+                self._format_sources(await self.retriever.search(question.strip()[7:]))
             )
             return
-        yield event.plain_result(await self.answers.answer(question))
+        yield event.plain_result(await self.agent.answer(event, question))
 
     @filter.command("nju_sync")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def nju_sync(self, event: AstrMessageEvent, action: str = ""):
+        mark_command_handled(event)
         if action.lower() == "status":
             yield event.plain_result(self.syncer.status_text())
             return
@@ -85,6 +89,7 @@ class NjuQaPlugin(Star):
     @filter.command("nju_index")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def nju_index(self, event: AstrMessageEvent, action: str = ""):
+        mark_command_handled(event)
         if action.lower() != "rebuild":
             yield event.plain_result("用法：/nju_index rebuild")
             return
@@ -93,41 +98,36 @@ class NjuQaPlugin(Star):
     @filter.command("nju_search")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def nju_search(self, event: AstrMessageEvent, query: str = ""):
+        mark_command_handled(event)
         yield event.plain_result(
-            self.answers.format_source_results(await self.answers.source_results(query))
+            self._format_sources(await self.retriever.search(query))
         )
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
-        text = (event.message_str or "").strip()
-        if not text or text.startswith("/"):
+        original = event.message_str or ""
+        is_at_me = self._is_at_me(event)
+        text = self._remove_at(event, original) if is_at_me else original
+        routed = self.router.route(event, text, is_at_me)
+        if not routed.should_handle or not routed.query:
             return
-        group = event.get_group_id() is not None
-        if group and not self.config.enable_group_at:
-            return
-        if not group and not self.config.enable_private_chat:
-            return
-        if group and not self._is_at_me(event):
-            lowered = text.casefold()
-            wake = next(
-                (
-                    word
-                    for word in self.config.wake_words
-                    if lowered.startswith(word.casefold())
-                ),
-                None,
-            )
-            if not wake:
-                return
-            text = text[len(wake) :].lstrip(" ，,：:")
-        if not text:
-            return
+        mark_command_handled(event)
         try:
-            yield event.plain_result(await self.answers.answer(text))
-            event.stop_event()
+            yield event.plain_result(await self.agent.answer(event, routed.query))
         except Exception:
             logger.exception("NJU QA message handling failed")
             yield event.plain_result("处理问题时出错，请稍后重试。")
+
+    @staticmethod
+    def _format_sources(results) -> str:
+        if not results:
+            return "知识库中暂未找到可靠答案"
+        lines = ["参考来源："]
+        lines.extend(
+            f"{number}. 《{result.document.title}》：{result.document.url}"
+            for number, result in enumerate(results, 1)
+        )
+        return "\n".join(lines)
 
     def _is_at_me(self, event: AstrMessageEvent) -> bool:
         try:
@@ -139,6 +139,20 @@ class NjuQaPlugin(Star):
             )
         except (AttributeError, ImportError):
             return False
+
+    @staticmethod
+    def _remove_at(event: AstrMessageEvent, fallback: str) -> str:
+        try:
+            from astrbot.api import message_components as comp
+
+            text = "".join(
+                part.text
+                for part in event.message_obj.message
+                if isinstance(part, comp.Plain)
+            ).strip()
+            return text or fallback
+        except (AttributeError, ImportError):
+            return fallback
 
     async def terminate(self):
         if self._sync_task and not self._sync_task.done():
