@@ -134,9 +134,44 @@ class NjuQaAgent:
         except Exception:
             return AGENT_ERROR
         text = str(getattr(response, "completion_text", "")).strip()
+        if (
+            requires_campus_evidence(prompt)
+            and not tracker.read_sources
+            and tracker.sources
+        ):
+            self._record_selected_documents(tracker)
+            response = await self._run_tool_loop(
+                event=event,
+                chat_provider_id=provider_id,
+                prompt=self._grounded_prompt(prompt, tracker),
+                system_prompt=AGENT_SYSTEM_PROMPT,
+                tracker=tracker,
+            )
+            text = str(getattr(response, "completion_text", "")).strip()
         if requires_campus_evidence(prompt) and not tracker.read_sources:
             return NO_EVIDENCE
         return append_verified_citations(text, tracker.sources, tracker.verified_urls)
+
+    @staticmethod
+    def _record_selected_documents(tracker: SourceTracker) -> None:
+        """Deterministic local read fallback after semantic search selected sources."""
+        for source in tracker.sources[:3]:
+            tracker.read_sources.add(
+                str(source.document.path or source.document.yuque_id)
+            )
+            tracker.record_read_content(source.document.body)
+
+    @staticmethod
+    def _grounded_prompt(question: str, tracker: SourceTracker) -> str:
+        materials = "\n\n".join(
+            f"[已读材料 {i}]《{source.document.title}》\n{source.document.body[:6000]}"
+            for i, source in enumerate(tracker.sources[:3], 1)
+        )
+        return f"""请回答原问题：{question}
+
+只能根据以下已读的知识库正文作答；如果正文无法支持某一具体事项，请明确说没有可靠资料，绝不能补充一般经验、网站、流程或联系方式。不要自行输出链接或来源列表。
+
+{materials}"""
 
     async def _run_tool_loop(
         self, *, tracker: SourceTracker, **kwargs: object

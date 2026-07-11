@@ -104,6 +104,23 @@ def test_no_provider_is_friendly_and_does_not_run_agent():
     assert asyncio.run(agent.answer(Event(), "你好")) == NO_PROVIDER
 
 
+def test_fact_search_without_agent_read_retries_with_selected_document_body():
+    calls = []
+
+    async def loop(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            kwargs["tools"][0].tracker.add([source()])
+        return Response("基于已读材料的回答")
+
+    agent = NjuQaAgent(
+        Context(), lambda tracker: [type("Tool", (), {"tracker": tracker})()], loop
+    )
+    answer = asyncio.run(agent.answer(Event(), "通识课需要多少学分？"))
+    assert len(calls) == 2 and "已读材料" in calls[1]["prompt"]
+    assert "https://yuque.test/doc" in answer
+
+
 def test_no_tool_results_leave_no_fake_citation():
     async def loop(**kwargs):
         return Response("知识库中暂未找到可靠答案")
