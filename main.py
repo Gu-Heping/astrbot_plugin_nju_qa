@@ -140,14 +140,24 @@ class NjuQaPlugin(Star):
             return
         tool = GrepLocalDocsTool(index=self.index, docs_root=self.store.root)
         result = await tool._run(keywords)
+        # If the exact phrase yields nothing, try splitting long Chinese queries
+        # into overlapping 2-character terms (e.g. "确认录取" → "确认 录取").
+        if not result.get("results"):
+            cleaned = keywords.strip().replace(" ", "")
+            if len(cleaned) >= 4:
+                split_terms = " ".join(
+                    cleaned[i : i + 2] for i in range(0, len(cleaned) - 1, 2)
+                )
+                result = await tool._run(split_terms)
         if not result.get("results"):
             yield event.plain_result("本地文档中未找到匹配内容。")
             return
         lines = [f"共找到 {result['count']} 条："]
         for i, hit in enumerate(result["results"][:10], 1):
             snippet = hit.get("snippet", "").replace("\n", " ")[:200]
+            source_url = hit.get("source_url") or hit.get("url") or ""
             lines.append(
-                f"{i}. 《{hit.get('title')}》：{hit.get('source_url')}\n   {snippet}..."
+                f"{i}. 《{hit.get('title')}》：{source_url}\n   {snippet}..."
             )
         yield event.plain_result("\n".join(lines))
 
