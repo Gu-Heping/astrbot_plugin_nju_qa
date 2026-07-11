@@ -6,6 +6,8 @@ import re
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
+from astrbot.api import logger
+
 from .doc_utils import read_document_content
 from .models import SearchResult
 from .prompts import AGENT_SYSTEM_PROMPT
@@ -15,7 +17,7 @@ NO_PROVIDER = "当前未配置 LLM 服务。请联系管理员配置后再试。
 AGENT_ERROR = "当前无法调用 LLM 服务，请稍后重试。"
 NO_EVIDENCE = "知识库中暂未找到可靠资料，我不能据此给出南京大学的具体结论。"
 
-_MAX_GROUNDING_SOURCES = 5
+_MAX_GROUNDING_SOURCES = 7
 _NO_EVIDENCE_MARKERS = ("知识库中暂未找到可靠资料", "知识库中暂未找到可靠答案")
 
 
@@ -71,11 +73,15 @@ def append_verified_citations(
     # information; otherwise keep the sources so the user can inspect the original
     # documents.
     if _is_pure_no_evidence(text) or not sources:
+        logger.info("NJU agent: suppressing citations for no-evidence answer")
         return text
+    # Limit citations to the most relevant sources to avoid overwhelming the user.
+    top_sources = sources[:5]
     citations = "\n".join(
         f"{number}. 《{result.document.title}》：{result.document.url}"
-        for number, result in enumerate(sources, 1)
+        for number, result in enumerate(top_sources, 1)
     )
+    logger.info("NJU agent: appending %d citations", len(top_sources))
     return f"{text}\n\n参考来源：\n{citations}"
 
 
@@ -153,7 +159,9 @@ class NjuQaAgent:
         provider_id = await self.context.get_current_chat_provider_id(
             getattr(event, "unified_msg_origin")
         )
+        logger.info("NJU agent start: provider=%s prompt=%r", provider_id, prompt)
         if not provider_id:
+            logger.warning("NJU agent: no chat provider configured")
             return NO_PROVIDER
 
         tracker = SourceTracker()
@@ -166,19 +174,32 @@ class NjuQaAgent:
                 tracker=tracker,
             )
         except Exception:
+            logger.exception("NJU agent tool loop failed")
             return AGENT_ERROR
         text = str(getattr(response, "completion_text", "")).strip()
+        logger.info(
+            "NJU agent first response: length=%d sources=%d reliable=%d",
+            len(text),
+            len(tracker.sources),
+            sum(1 for s in tracker.sources if s.reliable),
+        )
 
         if not requires_campus_evidence(prompt):
-            return append_verified_citations(text, tracker.sources, tracker.verified_urls)
+            result = append_verified_citations(
+                text, tracker.sources, tracker.verified_urls
+            )
+            logger.info("NJU agent direct answer: length=%d", len(result))
+            return result
 
         # For campus-factual questions, require reliable sources.
         reliable_sources = [s for s in tracker.sources if s.reliable]
         if not reliable_sources:
+            logger.info("NJU agent: no reliable sources for campus question")
             return NO_EVIDENCE
 
         # Ground the answer in the most relevant chunk snippets.
         self._record_selected_documents(tracker)
+        logger.info("NJU agent grounding with %d sources", len(tracker.sources[:_MAX_GROUNDING_SOURCES]))
         response = await self._run_tool_loop(
             event=event,
             chat_provider_id=provider_id,
@@ -188,8 +209,11 @@ class NjuQaAgent:
         )
         text = str(getattr(response, "completion_text", "")).strip()
         if not tracker.read_sources:
+            logger.info("NJU agent: no documents were read during grounding")
             return NO_EVIDENCE
-        return append_verified_citations(text, tracker.sources, tracker.verified_urls)
+        result = append_verified_citations(text, tracker.sources, tracker.verified_urls)
+        logger.info("NJU agent grounded answer: length=%d sources=%d", len(result), len(tracker.sources))
+        return result
 
     def _read_source_body(self, source: SearchResult, limit: int = 8000) -> str:
         """Return full document body when docs_root is configured, else chunk snippet."""
@@ -228,7 +252,7 @@ class NjuQaAgent:
 
 我已为你读取了以下最相关的知识库文档（或片段）。请优先根据这些材料作答：
 - 材料中明确提到的具体事项，直接整理成条理清晰的答案；
-- 材料中确实没有提到的具体事项，必须明确说“知识库中暂未找到可靠资料”，不得编造或补充一般经验、网站、流程、联系方式；
+- 材料中没有提到的具体事项直接略过，不要单独列出“未找到”或“未提及”的事项清单；
 - 如果某个材料明显不足，可以调用 read_doc(file_path) 读取完整文档，但只读取已列出的文档；
 - 不要自行输出链接或来源列表，系统会自动附加。
 

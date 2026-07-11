@@ -237,28 +237,39 @@ class SyncService:
 
     async def rebuild_index(self) -> str:
         async with self._sync_lock:
-            async with self._index_lock:
-                from .chunk_indexer import ChunkIndexer
+            self.running = True
+            try:
+                async with self._index_lock:
+                    from .chunk_indexer import ChunkIndexer
 
-                indexer = ChunkIndexer(
-                    self.chunk_store,
-                    self.vector_index,
-                    self._embed,
-                    chunk_size=self.config.chunk_size,
-                    overlap=self.config.chunk_overlap,
-                )
-                result = await indexer.rebuild(self.index.all_documents())
-                self._last_index_error = (
-                    "; ".join(result.get("errors", [])) or None
-                )
-                self.index.set_state(
-                    "last_index",
-                    datetime.now(timezone.utc).isoformat(),
-                )
+                    indexer = ChunkIndexer(
+                        self.chunk_store,
+                        self.vector_index,
+                        self._embed,
+                        chunk_size=self.config.chunk_size,
+                        overlap=self.config.chunk_overlap,
+                    )
+                    result = await indexer.rebuild(self.index.all_documents())
+                    self._last_index_error = (
+                        "; ".join(result.get("errors", [])) or None
+                    )
+                    self.index.set_state(
+                        "last_index",
+                        datetime.now(timezone.utc).isoformat(),
+                    )
+                    self.index.set_state(
+                        "last_index_result",
+                        f"chunks={result['chunks']} failed_docs={result['failed_documents']}",
+                    )
+            except Exception as exc:
+                self._last_index_error = f"{type(exc).__name__}: {exc}"
                 self.index.set_state(
                     "last_index_result",
-                    f"chunks={result['chunks']} failed_docs={result['failed_documents']}",
+                    f"failed: {exc}",
                 )
+                return f"索引重建失败：{exc}"
+            finally:
+                self.running = False
         return (
             f"向量索引重建完成：{result['chunks']} 个 chunk，"
             f"失败文档 {result['failed_documents']}。"

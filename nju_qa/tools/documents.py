@@ -45,6 +45,21 @@ class GrepLocalDocsTool(_Tool):
 
     async def _run(self, keywords: str, repo_filter: str = "", **_) -> dict:
         terms = [x for x in keywords.split() if x]
+        hits = self._search(terms, repo_filter)
+        # Fallback: long Chinese queries often fail exact substring matching.
+        # Split into overlapping 2-character terms (e.g. "确认录取" → "确认 录取").
+        if not hits:
+            cleaned = keywords.strip().replace(" ", "")
+            if len(cleaned) >= 4:
+                split_terms = [
+                    cleaned[i : i + 2] for i in range(0, len(cleaned) - 1, 2)
+                ]
+                hits = self._search(split_terms, repo_filter)
+        return {"count": len(hits), "results": hits[:20]}
+
+    def _search(self, terms: list[str], repo_filter: str = "") -> list[dict]:
+        if not terms:
+            return []
         hits = []
         for row in self.index.all_documents():
             if (
@@ -64,7 +79,7 @@ class GrepLocalDocsTool(_Tool):
                         "snippet": text[max(0, pos - 120) : pos + 500],
                     }
                 )
-        return {"count": len(hits), "results": hits[:20]}
+        return hits
 
 
 @dataclass

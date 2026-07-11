@@ -51,12 +51,16 @@ def read_document_content(
     file_path_obj = Path(file_path)
     if ".." in file_path_obj.parts:
         raise ValueError("invalid document path")
-    # file_path may already include the root prefix (e.g. stored relative to cwd).
+
+    # file_path may be relative to root, or relative to the project cwd with the
+    # root as a prefix. Try root-relative first; fall back to cwd-relative.
     candidate = (root_resolved / file_path_obj).resolve()
-    if not candidate.is_relative_to(root_resolved):
-        alt = file_path_obj.resolve()
-        if alt.is_relative_to(root_resolved):
-            candidate = alt
+    if (
+        not candidate.is_file()
+        or not candidate.is_relative_to(root_resolved)
+    ):
+        candidate = file_path_obj.resolve()
+
     if (
         candidate.is_symlink()
         or not candidate.is_file()

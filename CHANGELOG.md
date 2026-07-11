@@ -4,6 +4,25 @@
 
 ## [Unreleased]
 
+### Added
+
+- `/nju_grep`：全文搜索本地 Markdown，长中文查询未命中时自动按二字切分兜底。
+- `/nju_debug`：管理员命令，用于查看 AstrBot 对 `/nju` 命令的解析结果。
+- 后台任务启动反馈：`/nju_sync`、`/nju_index rebuild` 立即返回“已启动后台...”提示，避免用户误以为无响应。
+- Agent 关键步骤日志：provider、检索源数量、可靠源数量、grounding 源数量、引用数量。
+
+### Changed
+
+- 针对“详细整理/汇总/全面介绍”类问题，Agent 必须拆分为 2-4 个子主题分别检索，避免单次检索覆盖不全。
+- 引用来源限制为最多 5 条，减少答案被大量来源淹没的情况。
+- Grounding 材料来源上限从 5 提升到 7，优先保证事实性问题有足够依据。
+
+### Fixed
+
+- 修复部分 AstrBot 实例只发出命令 handler 第一个 `yield` 导致最终答案丢失的问题；`/nju`、`/nju_grep`、`/nju_search` 等改为单次 yield 返回。
+- 修复 `read_doc` / `get_doc_details` 因数据库中 `path` 列已包含 `docs_root` 前缀而报 `invalid document path` 的问题，并统一 `DocumentStore` 后续写入使用相对 `docs_root` 的路径。
+- 修复 `grep_local_docs` 对长中文关键词无法命中时的兜底检索逻辑。
+
 ## [0.1.0] - 2026-07-11
 
 ### Added

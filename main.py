@@ -146,8 +146,15 @@ class NjuQaPlugin(Star):
 
         # Regular question: strip the nju prefix.
         query = re.sub(r"^nju\s*", "", text, flags=re.IGNORECASE).strip()
-        yield event.plain_result("正在检索知识库并整理答案，请稍候...")
-        yield event.plain_result(await self.agent.answer(event, query))
+        logger.info("NJU command parsed query: %r", query)
+        try:
+            answer = await self.agent.answer(event, query)
+        except Exception as exc:
+            logger.exception("NJU QA agent failed")
+            yield event.plain_result(f"检索失败：{exc}")
+            return
+        logger.info("NJU command answer length=%d first_100=%r", len(answer), answer[:100])
+        yield event.plain_result(answer)
 
     @filter.command("nju_debug")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -219,15 +226,10 @@ class NjuQaPlugin(Star):
                 "索引重建正在进行中；请使用 /nju_sync status 查看状态。"
             )
             return
-        yield event.plain_result("开始重建 chunk store 与向量索引，请稍候...")
         self._rebuild_task = asyncio.create_task(self._rebuild())
-        try:
-            result = await self._rebuild_task
-        except Exception as exc:
-            logger.exception("Rebuild index failed")
-            yield event.plain_result(f"重建索引失败：{exc}")
-            return
-        yield event.plain_result(result)
+        yield event.plain_result(
+            "已启动后台索引重建；请使用 /nju_sync status 查看进度和结果。"
+        )
 
     @filter.command("nju_search")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -236,7 +238,6 @@ class NjuQaPlugin(Star):
         if not query.strip():
             yield event.plain_result("用法：/nju_search <查询词>")
             return
-        yield event.plain_result("正在执行检索调试，请稍候...")
         yield event.plain_result(
             self.retriever.debug_text(await self.retriever.debug_search(query))
         )

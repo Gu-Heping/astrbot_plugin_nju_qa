@@ -42,10 +42,12 @@ namespace 是语雀文档 URL `https://www.yuque.com/<namespace>/<slug>` 中的 
 - `/nju <问题>`：提问；回答只会引用实际检索到的 chunk 来源。
 - `/nju help`：帮助。
 - `/nju source <关键词>`：查看相关来源。
-- `/nju_sync`：管理员启动后台全量同步。
+- `/nju_grep <关键词>`：全文搜索本地 Markdown，长中文词会自动按二字切分兜底。
+- `/nju_sync`：管理员启动后台全量同步；启动后会立即返回状态提示。
 - `/nju_sync status`：管理员查看同步与 chunk/向量索引状态。
-- `/nju_index rebuild`：管理员重建 chunk 向量索引。
+- `/nju_index rebuild`：管理员重建 chunk 向量索引；启动后会立即返回状态提示。
 - `/nju_search <关键词>`：管理员查看混合检索调试信息（候选、分数、阈值）。
+- `/nju_debug`：管理员查看 AstrBot 对 `/nju` 命令的解析结果（用于排查命令路由）。
 
 当材料不足时，机器人会明确回复“知识库中暂未找到可靠资料”。高风险或易变信息应以来源的更新时间和南京大学官方最新通知为准。
 

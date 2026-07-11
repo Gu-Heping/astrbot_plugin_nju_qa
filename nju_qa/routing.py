@@ -22,6 +22,18 @@ def mark_command_handled(event: object) -> None:
         stop()
 
 
+def mark_command(event: object) -> None:
+    """Mark the event as handled without stopping propagation.
+
+    Use this for handlers that need to yield multiple messages.  The marker
+    prevents this plugin's ALL-message listener from double-handling the
+    command; call :func:`mark_command_handled` after the final yield to stop
+    propagation to other framework handlers.
+    """
+
+    setattr(event, COMMAND_MARKER, True)
+
+
 def is_command_message(text: str) -> bool:
     """Recognize a command syntactically, without maintaining command lists."""
 

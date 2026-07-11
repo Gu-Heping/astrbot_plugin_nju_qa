@@ -42,8 +42,8 @@ class DocumentStore:
         ):
             candidate = base / f"{stem}_{suffix}.md"
             suffix += 1
-        candidate.resolve().relative_to(self.root.resolve())
-        return candidate
+        # Persist relative paths so the SQLite records stay valid regardless of cwd.
+        return candidate.resolve().relative_to(self.root.resolve())
 
     def _has_id(self, path: Path, doc_id: str) -> bool:
         try:
@@ -51,10 +51,25 @@ class DocumentStore:
         except (OSError, ValueError):
             return False
 
+    @staticmethod
+    def _inside_root(target: Path, root: Path) -> bool:
+        try:
+            target.resolve().relative_to(root.resolve())
+            return True
+        except ValueError:
+            return False
+
+    def _to_target(self, path: Path) -> Path:
+        """Resolve a stored path (absolute or relative to root) into a filesystem path."""
+        target = path if path.is_absolute() else self.root / path
+        if not self._inside_root(target, self.root):
+            raise ValueError("document path outside document root")
+        return target
+
     def write(self, doc: Document) -> None:
         if not doc.path:
             raise ValueError("document path required")
-        doc.path.resolve().relative_to(self.root.resolve())
+        target = self._to_target(doc.path)
         fm = {
             "yuque_id": doc.yuque_id,
             "title": doc.title,
@@ -65,8 +80,8 @@ class DocumentStore:
             "created_at": doc.created_at,
             "updated_at": doc.updated_at,
         }
-        doc.path.parent.mkdir(parents=True, exist_ok=True)
-        doc.path.write_text(
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
             "---\n"
             + yaml.safe_dump(fm, allow_unicode=True, sort_keys=False)
             + "---\n\n"
@@ -75,7 +90,8 @@ class DocumentStore:
         )
 
     def read(self, path: Path) -> Document:
-        raw = path.read_text(encoding="utf-8")
+        target = self._to_target(path)
+        raw = target.read_text(encoding="utf-8")
         if not raw.startswith("---\n"):
             raise ValueError("missing frontmatter")
         _, head, body = raw.split("---\n", 2)
@@ -97,8 +113,5 @@ class DocumentStore:
         )
 
     def remove(self, path: Path) -> None:
-        try:
-            path.resolve().relative_to(self.root.resolve())
-            path.unlink(missing_ok=True)
-        except ValueError:
-            raise ValueError("refusing to delete outside document root")
+        target = self._to_target(path)
+        target.unlink(missing_ok=True)
