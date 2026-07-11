@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 import math
+import re
 import sqlite3
 from pathlib import Path
 from .models import Document
@@ -65,15 +66,67 @@ class DocumentIndex:
         self.open()
         return self.conn.execute("SELECT * FROM documents").fetchall()
 
+    def document_count(self) -> int:
+        return len(self.all_documents())
+
+    def vector_count(self) -> int:
+        self.open()
+        return self.conn.execute(
+            "SELECT count(*) FROM documents WHERE embedding IS NOT NULL"
+        ).fetchone()[0]
+
+    def find(
+        self,
+        query: str = "",
+        *,
+        title: str = "",
+        yuque_id: str = "",
+        slug: str = "",
+        url: str = "",
+        limit: int = 20,
+        offset: int = 0,
+    ):
+        self.open()
+        clauses = []
+        values = []
+        for column, value in (
+            ("title", title or query),
+            ("yuque_id", yuque_id),
+            ("slug", slug),
+            ("url", url),
+        ):
+            if value:
+                clauses.append(f"{column} LIKE ?")
+                values.append(f"%{value}%")
+        sql = (
+            "SELECT * FROM documents"
+            + (" WHERE " + " AND ".join(clauses) if clauses else "")
+            + " ORDER BY updated_at DESC LIMIT ? OFFSET ?"
+        )
+        return self.conn.execute(
+            sql, (*values, min(max(limit, 1), 100), max(offset, 0))
+        ).fetchall()
+
     def keyword(self, query: str, limit: int):
         self.open()
-        terms = [x for x in query.casefold().split() if x]
+        terms = self._terms(query)
         rows = self.all_documents()
-        return [
+        ranked = [
             (r, sum((r["title"] + " " + r["body"]).casefold().count(t) for t in terms))
             for r in rows
             if any(t in (r["title"] + r["body"]).casefold() for t in terms)
-        ][:limit]
+        ]
+        return sorted(ranked, key=lambda item: item[1], reverse=True)[:limit]
+
+    @staticmethod
+    def _terms(query: str) -> list[str]:
+        words = re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]{2,}", query.casefold())
+        terms = []
+        for word in words:
+            terms.append(word)
+            if len(word) > 2 and re.fullmatch(r"[\u4e00-\u9fff]+", word):
+                terms.extend(word[i : i + 2] for i in range(len(word) - 1))
+        return list(dict.fromkeys(terms))
 
     def vector(self, vector: list[float], limit: int):
         scored = []

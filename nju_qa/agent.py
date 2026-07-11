@@ -11,6 +11,7 @@ from .prompts import AGENT_SYSTEM_PROMPT
 
 NO_PROVIDER = "当前未配置 LLM 服务。请联系管理员配置后再试。"
 AGENT_ERROR = "当前无法调用 LLM 服务，请稍后重试。"
+NO_EVIDENCE = "知识库中暂未找到可靠资料，我不能据此给出南京大学的具体结论。"
 
 
 class SourceTracker:
@@ -51,6 +52,47 @@ def append_verified_citations(text: str, sources: list[SearchResult]) -> str:
     return f"{text}\n\n参考来源：\n{citations}"
 
 
+def requires_campus_evidence(prompt: str) -> bool:
+    """Conservative multi-signal guard; the Agent still chooses which tools to use."""
+    topics = (
+        "新生",
+        "校园",
+        "南大",
+        "南京大学",
+        "学分",
+        "课程",
+        "教务",
+        "门户",
+        "网站",
+        "补办",
+        "转专业",
+        "校区",
+        "住宿",
+        "奖助",
+        "考试",
+        "流程",
+    )
+    factual = (
+        "哪里",
+        "怎么",
+        "多少",
+        "什么",
+        "要求",
+        "需要",
+        "时间",
+        "地址",
+        "网站",
+        "办理",
+        "吗",
+        "？",
+        "?",
+    )
+    return sum(token in prompt for token in topics) >= 2 or (
+        any(token in prompt for token in topics)
+        and any(token in prompt for token in factual)
+    )
+
+
 ToolFactory = Callable[[SourceTracker], list[object]]
 ToolLoop = Callable[..., Awaitable[object]]
 
@@ -83,9 +125,10 @@ class NjuQaAgent:
             )
         except Exception:
             return AGENT_ERROR
-        return append_verified_citations(
-            str(getattr(response, "completion_text", "")).strip(), tracker.sources
-        )
+        text = str(getattr(response, "completion_text", "")).strip()
+        if requires_campus_evidence(prompt) and not tracker.sources:
+            return NO_EVIDENCE
+        return append_verified_citations(text, tracker.sources)
 
     async def _run_tool_loop(
         self, *, tracker: SourceTracker, **kwargs: object
@@ -98,5 +141,5 @@ class NjuQaAgent:
         from astrbot.core.agent.tool import ToolSet
 
         return await self.context.tool_loop_agent(
-            tools=ToolSet(tools), max_steps=8, tool_call_timeout=60, **kwargs
+            tools=ToolSet(tools), max_steps=12, tool_call_timeout=60, **kwargs
         )

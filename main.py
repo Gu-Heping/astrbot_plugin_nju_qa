@@ -17,7 +17,17 @@ from .nju_qa.document_store import DocumentStore
 from .nju_qa.retriever import HybridRetriever
 from .nju_qa.routing import MessageRouter, mark_command_handled
 from .nju_qa.sync_service import SyncService
-from .nju_qa.tools import SearchKnowledgeBaseTool
+from .nju_qa.tools import (
+    GetDocDetailsTool,
+    DocStatsTool,
+    GrepLocalDocsTool,
+    ListKnowledgeBasesTool,
+    ListRepoDocsTool,
+    ParseYuqueUrlTool,
+    ReadDocTool,
+    SearchDocsTool,
+    SearchKnowledgeBaseTool,
+)
 from .nju_qa.yuque_client import YuqueClient
 
 
@@ -39,7 +49,15 @@ class NjuQaPlugin(Star):
         self.agent = NjuQaAgent(
             self.context,
             lambda tracker: [
-                SearchKnowledgeBaseTool(retriever=self.retriever, tracker=tracker)
+                SearchKnowledgeBaseTool(retriever=self.retriever, tracker=tracker),
+                GrepLocalDocsTool(index=self.index, docs_root=self.store.root),
+                ReadDocTool(index=self.index, docs_root=self.store.root),
+                SearchDocsTool(index=self.index, docs_root=self.store.root),
+                GetDocDetailsTool(index=self.index, docs_root=self.store.root),
+                ParseYuqueUrlTool(index=self.index, docs_root=self.store.root),
+                ListKnowledgeBasesTool(index=self.index, docs_root=self.store.root),
+                ListRepoDocsTool(index=self.index, docs_root=self.store.root),
+                DocStatsTool(index=self.index, docs_root=self.store.root),
             ],
         )
         self.router = MessageRouter(
@@ -100,7 +118,7 @@ class NjuQaPlugin(Star):
     async def nju_search(self, event: AstrMessageEvent, query: str = ""):
         mark_command_handled(event)
         yield event.plain_result(
-            self._format_sources(await self.retriever.search(query))
+            self.retriever.debug_text(await self.retriever.debug_search(query))
         )
 
     @filter.event_message_type(filter.EventMessageType.ALL)

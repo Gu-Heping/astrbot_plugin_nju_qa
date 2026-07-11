@@ -26,7 +26,11 @@ class SyncService:
     def status_text(self) -> str:
         state = "进行中" if self.running else "空闲"
         last = self.index.get_state("last_sync") or "从未"
-        return f"同步状态：{state}\n上次同步：{last}\n文档数：{len(self.index.all_documents())}"
+        return (
+            f"同步状态：{state}\n上次同步：{last}\nMarkdown 文档数：{len(list(self.store.root.rglob('*.md')))}"
+            f"\nSQLite 文档数：{self.index.document_count()}\n向量文档数：{self.index.vector_count()}"
+            f"\nEmbedding 已配置：{bool(self.config.embedding_api_key and self.config.embedding_base_url)}"
+        )
 
     async def sync_all(self) -> SyncResult:
         if not self.config.yuque_token:

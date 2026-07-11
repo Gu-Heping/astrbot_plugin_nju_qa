@@ -45,16 +45,21 @@ class HybridRetriever:
         )
 
     async def search(self, query: str) -> list[SearchResult]:
+        report = await self.debug_search(query)
+        return report["selected"]
+
+    async def debug_search(self, query: str) -> dict:
         merged: dict[str, float] = {}
-        for row, score in self.index.keyword(query, self.config.retrieval_top_k * 2):
+        keyword = self.index.keyword(query, self.config.retrieval_top_k * 4)
+        for row, score in keyword:
             merged[row["yuque_id"]] = max(
                 merged.get(row["yuque_id"], 0), min(1, score / 3)
             )
         vector = await self._embed(query)
+        vector_rows = []
         if vector:
-            for row, score in self.index.vector(
-                vector, self.config.retrieval_top_k * 2
-            ):
+            vector_rows = self.index.vector(vector, self.config.retrieval_top_k * 2)
+            for row, score in vector_rows:
                 merged[row["yuque_id"]] = max(merged.get(row["yuque_id"], 0), score)
         lookup = {r["yuque_id"]: r for r in self.index.all_documents()}
         selected = []
@@ -67,7 +72,32 @@ class HybridRetriever:
                 )
             if len(selected) >= self.config.retrieval_top_k:
                 break
-        return selected
+        return {
+            "mode": "hybrid" if vector else "keyword",
+            "embedding_available": bool(vector),
+            "keyword": [(r["title"], s) for r, s in keyword],
+            "vector": [(r["title"], s) for r, s in vector_rows],
+            "selected": selected,
+            "threshold": self.config.score_threshold,
+            "vector_count": self.index.vector_count(),
+        }
+
+    def debug_text(self, report: dict) -> str:
+        lines = [
+            f"检索模式：{report['mode']}",
+            f"Embedding 可用：{report['embedding_available']}",
+            f"向量文档数：{report['vector_count']}",
+            f"关键词候选：{len(report['keyword'])}",
+            f"阈值：{report['threshold']}",
+        ]
+        lines += [f"关键词 {title}: {score}" for title, score in report["keyword"][:10]]
+        lines += [
+            f"向量 {title}: {score:.3f}" for title, score in report["vector"][:10]
+        ]
+        lines += [
+            f"最终 《{x.document.title}》: {x.score:.3f}" for x in report["selected"]
+        ]
+        return "\n".join(lines)
 
     async def rebuild_embeddings(self) -> int:
         count = 0
