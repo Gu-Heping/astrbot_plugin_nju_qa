@@ -76,6 +76,19 @@ def _strip_frontmatter_and_meta_table(body: str) -> str:
     return body
 
 
+def _clean_text(text: str) -> str:
+    """Remove images and HTML tags; keep link text and URL."""
+    # Drop markdown images entirely.
+    text = re.sub(r"!\[.*?\]\(.*?\)", "", text)
+    # Keep both link text and URL.
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", text)
+    # Drop HTML tags (including Yuque font/color spans).
+    text = re.sub(r"<[^>]+>", "", text)
+    # Normalize whitespace.
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
 def _split_by_markdown_boundaries(text: str) -> list[str]:
     """Split on blank lines and markdown headings, preserving heading context."""
     # Keep headings attached to the following paragraph by replacing heading newline with a marker.
@@ -194,14 +207,15 @@ def split_markdown(
     result: list[Chunk] = []
     index = 0
     for part in parts:
-        if not part.strip():
+        cleaned = _clean_text(part)
+        if len(cleaned.strip()) < 3:
             continue
         chunk = Chunk(
-            chunk_id=_stable_chunk_id(document_id, index, part),
+            chunk_id=_stable_chunk_id(document_id, index, cleaned),
             document_id=document_id,
             chunk_index=index,
-            content=part,
-            content_hash=_content_hash(part),
+            content=cleaned,
+            content_hash=_content_hash(cleaned),
             title=title,
             repository=repository,
             namespace=namespace,

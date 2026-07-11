@@ -63,7 +63,25 @@ def test_chunk_metadata_present():
     assert c.source_url == "https://example.test/doc"
 
 
-def test_repeated_index_is_deduplicated_by_content_hash():
+def test_image_only_chunks_are_dropped():
+    body = "# 标题\n\n" + "![](https://example.com/a.png)" * 5
+    chunks = _make_doc(body)
+    assert all("![" not in c.content for c in chunks)
+
+
+def test_html_tags_and_images_are_cleaned():
+    body = (
+        '# 标题\n\n'
+        '![](https://example.com/a.png)\n\n'
+        '<font style="color:red">正文</font> [链接](https://nju.edu.cn) 结束。'
+    )
+    chunks = _make_doc(body)
+    assert chunks
+    text = chunks[0].content
+    assert "![" not in text
+    assert "<font" not in text
+    assert "https://nju.edu.cn" in text
+    assert "链接" in text
     body = "# A\n\n" + "内容。" * 50
     a = _make_doc(body, doc_id="7")
     b = _make_doc(body, doc_id="7")
