@@ -11,6 +11,7 @@ from astrbot.api.star import Context, Star, register
 
 # AstrBot imports plugins as packages, so these must remain package-relative.
 from .nju_qa.agent import NjuQaAgent
+from .nju_qa.chunk_store import ChunkStore
 from .nju_qa.config import PluginConfig
 from .nju_qa.document_index import DocumentIndex
 from .nju_qa.document_store import DocumentStore
@@ -29,6 +30,7 @@ from .nju_qa.tools import (
     SearchKnowledgeBaseTool,
 )
 from .nju_qa.yuque_client import YuqueClient
+from .nju_qa.vector_index import ChunkVectorIndex
 
 
 @register("astrbot_plugin_nju_qa", "peace", "南京大学知识库问答助手", "0.1.0")
@@ -43,9 +45,25 @@ class NjuQaPlugin(Star):
         )
         self.store = DocumentStore(data_dir / "documents")
         self.index = DocumentIndex(data_dir / "nju_qa.sqlite3")
+        self.chunk_store = ChunkStore(data_dir / "chunks.sqlite3")
         self.client = YuqueClient(self.config.yuque_token, self.config.yuque_base_url)
-        self.syncer = SyncService(self.config, self.client, self.store, self.index)
-        self.retriever = HybridRetriever(self.index, self.config)
+        self.vector_index = ChunkVectorIndex(
+            data_dir / "vectors", self.config.embedding_model
+        )
+        self.syncer = SyncService(
+            self.config,
+            self.client,
+            self.store,
+            self.index,
+            chunk_store=self.chunk_store,
+            vector_index=self.vector_index,
+        )
+        self.retriever = HybridRetriever(
+            self.index,
+            self.config,
+            chunk_store=self.chunk_store,
+            vector_index=self.vector_index,
+        )
         self.agent = NjuQaAgent(
             self.context,
             lambda tracker: [
@@ -85,6 +103,7 @@ class NjuQaPlugin(Star):
 
     async def initialize(self):
         self.index.open()
+        self.chunk_store.open()
 
     async def _sync(self) -> str:
         result = await self.syncer.sync_all()
@@ -194,3 +213,5 @@ class NjuQaPlugin(Star):
             await asyncio.gather(self._sync_task, return_exceptions=True)
         await self.client.close()
         self.index.close()
+        self.chunk_store.close()
+        self.vector_index.close()

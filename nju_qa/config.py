@@ -19,6 +19,8 @@ class PluginConfig:
     enable_group_at: bool = True
     retrieval_top_k: int = 5
     score_threshold: float = 0.25
+    chunk_size: int = 1200
+    chunk_overlap: int = 180
 
     @classmethod
     def from_mapping(cls, raw: Any) -> "PluginConfig":
@@ -47,8 +49,12 @@ class PluginConfig:
             words = tuple(x.strip() for x in words.split(",") if x.strip())
         top_k = int(raw.get("retrieval_top_k", 5))
         threshold = float(raw.get("score_threshold", 0.25))
+        chunk_size = int(raw.get("chunk_size", 1200))
+        chunk_overlap = int(raw.get("chunk_overlap", 180))
         if not 1 <= top_k <= 20 or not 0 <= threshold <= 1:
             raise ValueError("检索配置超出允许范围")
+        if not 200 <= chunk_size <= 8000 or not 0 <= chunk_overlap < chunk_size // 2:
+            raise ValueError("chunk 配置超出允许范围")
         return cls(
             str(raw.get("yuque_token", "")),
             base,
@@ -61,4 +67,6 @@ class PluginConfig:
             bool(raw.get("enable_group_at", True)),
             top_k,
             threshold,
+            chunk_size,
+            chunk_overlap,
         )

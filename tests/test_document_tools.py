@@ -49,7 +49,24 @@ def test_yuque_url_query_and_anchor_parse():
 
 
 def test_keyword_fallback_without_embedding(tmp_path):
-    index, _ = make_index(tmp_path)
+    index, doc = make_index(tmp_path)
+    from nju_qa.chunk_store import ChunkStore
+    from nju_qa.chunking import split_markdown
+
+    chunk_store = ChunkStore(tmp_path / "chunks.sqlite3")
+    chunk_store.open()
+    chunks = split_markdown(
+        doc.yuque_id,
+        doc.body,
+        title=doc.title,
+        repository=doc.repository,
+        namespace=doc.namespace,
+        slug=doc.slug,
+        file_path=str(doc.path),
+        source_url=doc.url,
+        updated_at=doc.updated_at,
+    )
+    chunk_store.save_document_chunks(doc.yuque_id, chunks)
     from nju_qa.config import PluginConfig
 
     report = asyncio.run(
@@ -58,6 +75,7 @@ def test_keyword_fallback_without_embedding(tmp_path):
             PluginConfig.from_mapping(
                 {"yuque_repositories": ["nju/guide"], "score_threshold": 0}
             ),
+            chunk_store=chunk_store,
         ).debug_search("新生网站")
     )
     assert report["mode"] == "keyword" and report["selected"]
