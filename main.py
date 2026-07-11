@@ -150,6 +150,20 @@ class NjuQaPlugin(Star):
         yield event.plain_result("正在检索知识库并整理答案，请稍候...")
         yield event.plain_result(await self.agent.answer(event, query))
 
+    @filter.command("nju_debug")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def nju_debug(self, event: AstrMessageEvent, question: str = ""):
+        """Diagnostic command to inspect how AstrBot parses /nju messages."""
+        mark_command_handled(event)
+        text = (getattr(event, "message_str", None) or "").strip()
+        source_re = r"^/nju\s+source\s+"
+        matched = bool(re.match(source_re, text, re.IGNORECASE))
+        yield event.plain_result(
+            f"message_str: {repr(text)}\n"
+            f"handler_arg: {repr(question)}\n"
+            f"matched_source: {matched}"
+        )
+
     @filter.command("nju_grep")
     async def nju_grep(self, event: AstrMessageEvent, keywords: str = ""):
         mark_command_handled(event)
