@@ -85,7 +85,10 @@ class ReadDocTool(_Tool):
     async def _run(
         self, file_path: str, offset: int = 0, limit: int = 12000, **_
     ) -> dict:
-        result = read_document_content(self.docs_root, file_path, offset, limit)
+        try:
+            result = read_document_content(self.docs_root, file_path, offset, limit)
+        except ValueError as exc:
+            return {"error": str(exc), "file_path": file_path}
         if self.tracker:
             self.tracker.read_sources.add(file_path)
             self.tracker.record_read_content(result["content"])
@@ -171,11 +174,19 @@ class GetDocDetailsTool(_Tool):
         results = [doc_record_to_public_dict(row) for row in rows]
         if len(results) != 1 or not include_content:
             return {"count": len(results), "results": results}
-        result = {
-            "count": 1,
-            "document": results[0],
-            **read_document_content(self.docs_root, results[0]["path"], offset, limit),
-        }
+        try:
+            result = {
+                "count": 1,
+                "document": results[0],
+                **read_document_content(self.docs_root, results[0]["path"], offset, limit),
+            }
+        except ValueError as exc:
+            return {
+                "count": 1,
+                "document": results[0],
+                "error": str(exc),
+                "file_path": results[0]["path"],
+            }
         if self.tracker:
             self.tracker.read_sources.add(results[0]["path"])
             self.tracker.record_read_content(result["content"])

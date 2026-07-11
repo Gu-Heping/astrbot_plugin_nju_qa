@@ -13,6 +13,9 @@ NO_PROVIDER = "当前未配置 LLM 服务。请联系管理员配置后再试。
 AGENT_ERROR = "当前无法调用 LLM 服务，请稍后重试。"
 NO_EVIDENCE = "知识库中暂未找到可靠资料，我不能据此给出南京大学的具体结论。"
 
+_MAX_GROUNDING_SOURCES = 5
+_NO_EVIDENCE_MARKERS = ("知识库中暂未找到可靠资料", "知识库中暂未找到可靠答案")
+
 
 class SourceTracker:
     """Collects only sources that an Agent tool actually returned this turn."""
@@ -51,6 +54,11 @@ def append_verified_citations(
         lambda match: match.group(0) if match.group(0) in allowed_urls else "",
         text,
     )
+    # If the answer itself says no evidence was found, do not append a contradictory
+    # source list.
+    lowered = text.casefold()
+    if any(marker.casefold() in lowered for marker in _NO_EVIDENCE_MARKERS):
+        return text
     if not sources:
         return text
     citations = "\n".join(
@@ -79,6 +87,16 @@ def requires_campus_evidence(prompt: str) -> bool:
         "奖助",
         "考试",
         "流程",
+        "录取",
+        "档案",
+        "户口",
+        "团",
+        "军训",
+        "体检",
+        "入学",
+        "报到",
+        "党组织",
+        "团组织",
     )
     factual = (
         "哪里",
@@ -159,8 +177,8 @@ class NjuQaAgent:
 
     @staticmethod
     def _record_selected_documents(tracker: SourceTracker) -> None:
-        """Use chunk snippets for grounding instead of full document bodies."""
-        for source in tracker.sources[:3]:
+        """Mark top chunk snippets as already read for URL extraction."""
+        for source in tracker.sources[:_MAX_GROUNDING_SOURCES]:
             tracker.read_sources.add(
                 str(source.document.path or source.document.yuque_id)
             )
@@ -172,12 +190,16 @@ class NjuQaAgent:
     @staticmethod
     def _grounded_prompt(question: str, tracker: SourceTracker) -> str:
         materials = "\n\n".join(
-            f"[已读材料 {i}]《{source.document.title}》\n{source.chunk.content_snippet[:6000] if source.chunk else source.document.body[:6000]}"
-            for i, source in enumerate(tracker.sources[:3], 1)
+            f"[已读材料 {i}]《{source.document.title}》（{source.document.url}）\n{source.chunk.content_snippet[:5000] if source.chunk else source.document.body[:5000]}"
+            for i, source in enumerate(tracker.sources[:_MAX_GROUNDING_SOURCES], 1)
         )
         return f"""请回答原问题：{question}
 
-只能根据以下已读的知识库正文作答。正文中没有提到的具体事项，必须明确说“知识库中暂未找到可靠资料”，绝不能补充一般经验、网站、流程或联系方式。不要自行输出链接或来源列表。
+我已为你读取了以下最相关的知识库片段。请优先根据这些片段作答：
+- 片段中明确提到的具体事项，直接整理成条理清晰的答案；
+- 片段中确实没有提到的具体事项，必须明确说“知识库中暂未找到可靠资料”，不得编造或补充一般经验、网站、流程、联系方式；
+- 如果某个片段信息明显不足，可以调用 read_doc(file_path) 读取完整文档，但只读取已列出的文档；
+- 不要自行输出链接或来源列表，系统会自动附加。
 
 {materials}"""
 

@@ -258,7 +258,7 @@ class HybridRetriever:
                         chunk_id=current.chunk_id,
                         document_id=current.document_id,
                         title=current.title,
-                        content_snippet=(current.content_snippet + "\n\n" + next_item.content_snippet)[:1200],
+                        content_snippet=(current.content_snippet + "\n\n" + next_item.content_snippet)[:2400],
                         source_url=current.source_url,
                         vector_raw_score=max(current.vector_raw_score, next_item.vector_raw_score),
                         vector_score_type=current.vector_score_type,
