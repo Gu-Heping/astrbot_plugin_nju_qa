@@ -21,6 +21,7 @@ from .nju_qa.rate_limiter import RateLimiter, RateLimitState
 from .nju_qa.retriever import HybridRetriever
 from .nju_qa.routing import MessageRouter, mark_command_handled
 from .nju_qa.sync_service import SyncService
+from .nju_qa.table_renderer import clean_table_images, render_tables_as_images
 from .nju_qa.tools import (
     GetDocDetailsTool,
     DocStatsTool,
@@ -41,6 +42,24 @@ def _plain(event: AstrMessageEvent, text: str):
     return event.plain_result(markdown_to_plaintext(text))
 
 
+def _build_rich_result(event: AstrMessageEvent, segments: list[tuple[str, str]]):
+    """Build a message chain from text/image segments."""
+    from astrbot.api import message_components as comp
+
+    chain: list[object] = []
+    for seg_type, content in segments:
+        if seg_type == "text":
+            if content.strip():
+                chain.append(comp.Plain(content))
+        elif seg_type == "image":
+            chain.append(comp.Image.fromFileSystem(content))
+    if not chain:
+        return event.plain_result("")
+    if len(chain) == 1 and isinstance(chain[0], comp.Plain):
+        return event.plain_result(chain[0].text)
+    return event.chain_result(chain)
+
+
 @register("astrbot_plugin_nju_qa", "peace", "南京大学知识库问答助手", "0.1.0")
 class NjuQaPlugin(Star):
     """Explicitly triggered NJU knowledge-base Q&A plugin."""
@@ -51,6 +70,7 @@ class NjuQaPlugin(Star):
         data_dir = Path(
             getattr(self, "data_dir", Path("data") / "astrbot_plugin_nju_qa")
         )
+        self._table_image_dir = data_dir / "table_images"
         self.store = DocumentStore(data_dir / "documents")
         self.index = DocumentIndex(data_dir / "nju_qa.sqlite3")
         self.chunk_store = ChunkStore(data_dir / "chunks.sqlite3")
@@ -120,6 +140,7 @@ class NjuQaPlugin(Star):
     async def initialize(self):
         self.index.open()
         self.chunk_store.open()
+        clean_table_images(self._table_image_dir)
 
     async def _sync(self) -> str:
         result = await self.syncer.sync_all()
@@ -142,22 +163,22 @@ class NjuQaPlugin(Star):
         rl_state = self._check_rate_limit(event)
         if rl_state:
             if not rl_state.silent:
-                yield _plain(event, self._rate_limit_message(rl_state))
+                yield self._rich_result(event, self._rate_limit_message(rl_state))
             return
 
         source_match = re.match(r"^nju\s+source\s+(.+)$", text, re.IGNORECASE)
         if source_match:
             keyword = source_match.group(1).strip()
             if not keyword:
-                yield _plain(event,"用法：/nju source <关键词>")
+                yield self._rich_result(event,"用法：/nju source <关键词>")
                 return
-            yield _plain(event,
+            yield self._rich_result(event,
                 self._format_sources(await self.retriever.search(keyword))
             )
             return
 
         if re.match(r"^nju(\s+help)?$", text, re.IGNORECASE):
-            yield _plain(event,
+            yield self._rich_result(event,
                 "/nju <问题>：查询知识库\n"
                 "/nju source <关键词>：查看来源\n"
                 "/nju_grep <关键词>：全文搜索本地文档\n"
@@ -173,10 +194,10 @@ class NjuQaPlugin(Star):
             answer = await self.agent.answer(event, query)
         except Exception as exc:
             logger.exception("NJU QA agent failed")
-            yield _plain(event,f"检索失败：{exc}")
+            yield self._rich_result(event,f"检索失败：{exc}")
             return
         logger.info("NJU command answer length=%d first_100=%r", len(answer), answer[:100])
-        yield _plain(event,answer)
+        yield self._rich_result(event,answer)
 
     @filter.command("nju_debug")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -188,7 +209,7 @@ class NjuQaPlugin(Star):
         mark_command_handled(event)
         source_re = r"^nju\s+source\s+"
         matched = bool(re.match(source_re, text, re.IGNORECASE))
-        yield _plain(event,
+        yield self._rich_result(event,
             f"message_str: {repr(text)}\n"
             f"handler_arg: {repr(question)}\n"
             f"matched_source: {matched}"
@@ -203,10 +224,10 @@ class NjuQaPlugin(Star):
         rl_state = self._check_rate_limit(event)
         if rl_state:
             if not rl_state.silent:
-                yield _plain(event, self._rate_limit_message(rl_state))
+                yield self._rich_result(event, self._rate_limit_message(rl_state))
             return
         if not keywords.strip():
-            yield _plain(event,"用法：/nju_grep <空格分隔的关键词>")
+            yield self._rich_result(event,"用法：/nju_grep <空格分隔的关键词>")
             return
         tool = GrepLocalDocsTool(index=self.index, docs_root=self.store.root)
         result = await tool._run(keywords)
@@ -220,7 +241,7 @@ class NjuQaPlugin(Star):
                 )
                 result = await tool._run(split_terms)
         if not result.get("results"):
-            yield _plain(event,"本地文档中未找到匹配内容。")
+            yield self._rich_result(event,"本地文档中未找到匹配内容。")
             return
         lines = [f"共找到 {result['count']} 条："]
         for i, hit in enumerate(result["results"][:10], 1):
@@ -229,7 +250,7 @@ class NjuQaPlugin(Star):
             lines.append(
                 f"{i}. 《{hit.get('title')}》：{source_url}\n   {snippet}..."
             )
-        yield _plain(event,"\n".join(lines))
+        yield self._rich_result(event,"\n".join(lines))
 
     @filter.command("nju_sync")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -239,15 +260,15 @@ class NjuQaPlugin(Star):
             return
         mark_command_handled(event)
         if action.lower() == "status":
-            yield _plain(event,self.syncer.status_text())
+            yield self._rich_result(event,self.syncer.status_text())
             return
         if self._sync_task and not self._sync_task.done():
-            yield _plain(event,
+            yield self._rich_result(event,
                 "同步正在进行中；请使用 /nju_sync status 查看状态。"
             )
             return
         self._sync_task = asyncio.create_task(self._sync())
-        yield _plain(event,"已启动后台同步；请使用 /nju_sync status 查看状态。")
+        yield self._rich_result(event,"已启动后台同步；请使用 /nju_sync status 查看状态。")
 
     @filter.command("nju_index")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -257,15 +278,15 @@ class NjuQaPlugin(Star):
             return
         mark_command_handled(event)
         if action.lower() != "rebuild":
-            yield _plain(event,"用法：/nju_index rebuild")
+            yield self._rich_result(event,"用法：/nju_index rebuild")
             return
         if self._rebuild_task is not None and not self._rebuild_task.done():
-            yield _plain(event,
+            yield self._rich_result(event,
                 "索引重建正在进行中；请使用 /nju_sync status 查看状态。"
             )
             return
         self._rebuild_task = asyncio.create_task(self._rebuild())
-        yield _plain(event,
+        yield self._rich_result(event,
             "已启动后台索引重建；请使用 /nju_sync status 查看进度和结果。"
         )
 
@@ -277,9 +298,9 @@ class NjuQaPlugin(Star):
             return
         mark_command_handled(event)
         if not query.strip():
-            yield _plain(event,"用法：/nju_search <查询词>")
+            yield self._rich_result(event,"用法：/nju_search <查询词>")
             return
-        yield _plain(event,
+        yield self._rich_result(event,
             self.retriever.debug_text(await self.retriever.debug_search(query))
         )
 
@@ -304,13 +325,13 @@ class NjuQaPlugin(Star):
         rl_state = self._check_rate_limit(event)
         if rl_state:
             if not rl_state.silent:
-                yield _plain(event, self._rate_limit_message(rl_state))
+                yield self._rich_result(event, self._rate_limit_message(rl_state))
             return
         try:
-            yield _plain(event,await self.agent.answer(event, routed.query))
+            yield self._rich_result(event,await self.agent.answer(event, routed.query))
         except Exception:
             logger.exception("NJU QA message handling failed")
-            yield _plain(event,"处理问题时出错，请稍后重试。")
+            yield self._rich_result(event,"处理问题时出错，请稍后重试。")
 
     @staticmethod
     def _raw_message_text(event: AstrMessageEvent) -> str:
@@ -336,6 +357,13 @@ class NjuQaPlugin(Star):
             for number, result in enumerate(results, 1)
         )
         return "\n".join(lines)
+
+    def _rich_result(self, event: AstrMessageEvent, text: str):
+        """Return plain text or a text+image chain if the answer contains tables."""
+        if not self.config.render_tables_as_images:
+            return _plain(event, text)
+        segments = render_tables_as_images(text, self._table_image_dir)
+        return _build_rich_result(event, segments)
 
     @staticmethod
     def _chat_key(event: AstrMessageEvent) -> tuple[bool, str]:
