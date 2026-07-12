@@ -285,6 +285,9 @@ class NjuQaPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
+        # Ignore messages that AstrBot has already identified as commands.
+        if getattr(event, "is_command", False):
+            return
         original = self._raw_message_text(event)
         # AstrBot strips the leading '/' from event.message_str before command
         # handlers run, so ALL-message listeners see "audit ok" instead of
