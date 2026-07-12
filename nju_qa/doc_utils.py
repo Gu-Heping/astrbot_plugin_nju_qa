@@ -91,6 +91,85 @@ def read_document_content(
     }
 
 
+def read_document_lines(
+    root: Path,
+    file_path: str,
+    start_line: int = 0,
+    end_line: int | None = None,
+    context_lines: int = 0,
+    strip_metadata: bool = True,
+) -> dict:
+    """Read a local Markdown document by line numbers.
+
+    Lines are counted after optional metadata stripping so that line numbers
+    match the text used by the line-level grep tool.
+    """
+    if start_line < 0:
+        raise ValueError("invalid line range")
+    lines = _load_cleaned_document_lines(root, file_path, strip_metadata=strip_metadata)
+    total_lines = len(lines)
+    start = max(0, start_line)
+    end = total_lines if end_line is None else min(end_line, total_lines)
+    if context_lines:
+        start = max(0, start - context_lines)
+        end = min(total_lines, end + context_lines)
+    if start >= end:
+        return {
+            "metadata": _load_document_metadata(root, file_path),
+            "content": "",
+            "total_lines": total_lines,
+            "start_line": start,
+            "end_line": end,
+            "has_more": False,
+            "file_path": file_path,
+        }
+    content = "\n".join(f"{i + 1}: {lines[i]}" for i in range(start, end))
+    return {
+        "metadata": _load_document_metadata(root, file_path),
+        "content": content,
+        "total_lines": total_lines,
+        "start_line": start,
+        "end_line": end,
+        "has_more": end < total_lines,
+        "file_path": file_path,
+    }
+
+
+def _resolve_document_path(root: Path, file_path: str) -> Path:
+    """Resolve a stored path against the document root, enforcing containment."""
+    root_resolved = root.resolve()
+    file_path_obj = Path(file_path)
+    if ".." in file_path_obj.parts:
+        raise ValueError("invalid document path")
+    candidate = (root_resolved / file_path_obj).resolve()
+    if not candidate.is_file() or not candidate.is_relative_to(root_resolved):
+        candidate = file_path_obj.resolve()
+    if (
+        candidate.is_symlink()
+        or not candidate.is_file()
+        or not candidate.is_relative_to(root_resolved)
+    ):
+        raise ValueError("invalid document path")
+    return candidate
+
+
+def _load_document_metadata(root: Path, file_path: str) -> dict:
+    candidate = _resolve_document_path(root, file_path)
+    metadata, _ = parse_frontmatter(candidate.read_text(encoding="utf-8"))
+    return metadata
+
+
+def _load_cleaned_document_lines(
+    root: Path, file_path: str, *, strip_metadata: bool = True
+) -> list[str]:
+    """Return the cleaned text of a local document as a list of lines."""
+    candidate = _resolve_document_path(root, file_path)
+    _, body = parse_frontmatter(candidate.read_text(encoding="utf-8"))
+    if strip_metadata:
+        body = clean_document_body(body, preserve_paragraphs=True)
+    return body.splitlines()
+
+
 def parse_yuque_doc_url(url: str) -> tuple[str, str] | None:
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"}:

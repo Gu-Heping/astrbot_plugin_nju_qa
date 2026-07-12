@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from .chunk_indexer import ChunkIndexer
 from .config import PluginConfig
+from .doc_utils import clean_document_body
 from .document_index import DocumentIndex
 from .document_store import DocumentStore
 from .models import Document, SyncResult
@@ -129,6 +130,10 @@ class SyncService:
                 url = str(
                     detail.get("url") or f"https://www.yuque.com/{namespace}/{slug}"
                 )
+                raw_body = str(detail.get("body") or detail.get("content") or "")
+                # Strip Yuque HTML/markdown noise once at sync time so that
+                # line-level grep and chunk indexing work on clean text.
+                cleaned_body = clean_document_body(raw_body, preserve_paragraphs=True)
                 doc = Document(
                     doc_id,
                     title,
@@ -138,7 +143,7 @@ class SyncService:
                     url,
                     str(detail.get("created_at") or ""),
                     str(detail.get("updated_at") or ""),
-                    str(detail.get("body") or detail.get("content") or ""),
+                    cleaned_body,
                     path,
                 )
                 if existing and Path(existing["path"]) != path:

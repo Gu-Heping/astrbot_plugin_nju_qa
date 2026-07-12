@@ -83,7 +83,7 @@ class HybridRetriever:
     async def _vector_candidates(
         self, query: str, top_k: int
     ) -> list[tuple[ChunkResult, float]]:
-        if self.vector_index is None:
+        if self.vector_index is None or not self.config.enable_vector_search:
             return []
         vector = await self._embed(query)
         if vector is None:

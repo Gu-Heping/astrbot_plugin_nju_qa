@@ -14,6 +14,7 @@ class PluginConfig:
     embedding_api_key: str = ""
     embedding_base_url: str = ""
     embedding_model: str = "text-embedding-3-small"
+    enable_vector_search: bool = True
     wake_words: tuple[str, ...] = ("南大助手", "南小答", "nju")
     enable_private_chat: bool = True
     enable_group_at: bool = True
@@ -62,6 +63,7 @@ class PluginConfig:
             str(raw.get("embedding_api_key", "")),
             str(raw.get("embedding_base_url", "")),
             str(raw.get("embedding_model", "text-embedding-3-small")),
+            bool(raw.get("enable_vector_search", True)),
             tuple(words),
             bool(raw.get("enable_private_chat", True)),
             bool(raw.get("enable_group_at", True)),

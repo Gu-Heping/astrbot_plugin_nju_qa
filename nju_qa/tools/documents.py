@@ -6,10 +6,12 @@ from typing import Any
 from astrbot.api import FunctionTool
 from astrbot.api.event import AstrMessageEvent
 from ..doc_utils import (
+    _load_cleaned_document_lines,
     clean_document_body,
     doc_record_to_public_dict,
     parse_yuque_doc_url,
     read_document_content,
+    read_document_lines,
 )
 
 
@@ -30,22 +32,39 @@ class _Tool(FunctionTool):
 class GrepLocalDocsTool(_Tool):
     name: str = "grep_local_docs"
     description: str = (
-        "按多个核心关键词搜索本地 Markdown 正文，返回上下文和可读取的 file_path。"
+        "按空格分隔的关键词在本地的 Markdown 文档中逐行搜索，返回带行号的匹配片段。"
+        "对于具体事实、名称、流程、时间等精确查询，优先使用本工具而不是向量检索。"
     )
     parameters: dict = field(
         default_factory=lambda: {
             "type": "object",
             "properties": {
-                "keywords": {"type": "string", "description": "空格分隔的关键词"},
+                "keywords": {
+                    "type": "string",
+                    "description": "空格分隔的 1-4 个核心关键词，尽量用文档中可能出现的词",
+                },
                 "repo_filter": {"type": "string"},
+                "context_lines": {
+                    "type": "integer",
+                    "default": 2,
+                    "description": "匹配行前后保留的上下文行数",
+                },
+                "limit": {"type": "integer", "default": 10},
             },
             "required": ["keywords"],
         }
     )
 
-    async def _run(self, keywords: str, repo_filter: str = "", **_) -> dict:
+    async def _run(
+        self,
+        keywords: str,
+        repo_filter: str = "",
+        context_lines: int = 2,
+        limit: int = 10,
+        **_,
+    ) -> dict:
         terms = [x for x in keywords.split() if x]
-        hits = self._search(terms, repo_filter)
+        hits = self._search(terms, repo_filter, context_lines, limit)
         # Fallback: long Chinese queries often fail exact substring matching.
         # Split into overlapping 2-character terms (e.g. "确认录取" → "确认 录取").
         if not hits:
@@ -54,38 +73,111 @@ class GrepLocalDocsTool(_Tool):
                 split_terms = [
                     cleaned[i : i + 2] for i in range(0, len(cleaned) - 1, 2)
                 ]
-                hits = self._search(split_terms, repo_filter)
-        return {"count": len(hits), "results": hits[:20]}
+                hits = self._search(split_terms, repo_filter, context_lines, limit)
+        if self.tracker:
+            for hit in hits:
+                self.tracker.read_sources.add(hit["path"])
+                for match in hit.get("matches", []):
+                    self.tracker.record_read_content(match.get("snippet", ""))
+        return {"count": len(hits), "results": hits}
 
-    def _search(self, terms: list[str], repo_filter: str = "") -> list[dict]:
+    def _search(
+        self,
+        terms: list[str],
+        repo_filter: str,
+        context_lines: int,
+        limit: int,
+    ) -> list[dict]:
         if not terms:
             return []
-        hits = []
+        hits: list[dict] = []
+        cf = context_lines
         for row in self.index.all_documents():
             if (
                 repo_filter
                 and repo_filter.casefold() not in row["repository"].casefold()
             ):
                 continue
-            text = clean_document_body(row["title"] + "\n" + row["body"])
-            found = [x for x in terms if x.casefold() in text.casefold()]
-            if found:
-                pos = min(text.casefold().find(x.casefold()) for x in found)
-                public = doc_record_to_public_dict(row)
-                hits.append(
+            rel_path = row["path"]
+            if not rel_path:
+                continue
+            try:
+                lines = _load_cleaned_document_lines(self.docs_root, rel_path)
+            except (OSError, ValueError):
+                continue
+            if not lines:
+                continue
+
+            matched_indices: set[int] = set()
+            matched_terms: set[str] = set()
+            lower_terms = [t.casefold() for t in terms]
+            for i, line in enumerate(lines):
+                line_lower = line.casefold()
+                for term, term_lower in zip(terms, lower_terms):
+                    if term_lower in line_lower:
+                        matched_indices.add(i)
+                        matched_terms.add(term)
+            if not matched_indices:
+                continue
+
+            # Build contiguous windows around matched lines.
+            sorted_idx = sorted(matched_indices)
+            windows: list[tuple[int, int]] = []
+            cur_start = cur_end = sorted_idx[0]
+            for idx in sorted_idx[1:]:
+                if idx - cur_end <= cf + 1:
+                    cur_end = idx
+                else:
+                    windows.append((cur_start, cur_end))
+                    cur_start = cur_end = idx
+            windows.append((cur_start, cur_end))
+
+            # Expand and merge windows.
+            expanded = [
+                (max(0, s - cf), min(len(lines) - 1, e + cf)) for s, e in windows
+            ]
+            merged: list[tuple[int, int]] = []
+            for s, e in expanded:
+                if merged and s <= merged[-1][1] + 1:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+                else:
+                    merged.append((s, e))
+
+            matches = []
+            for s, e in merged:
+                snippet = "\n".join(
+                    f"{i + 1}: {lines[i]}" for i in range(s, e + 1)
+                )
+                matches.append(
                     {
-                        **public,
-                        "matched_keywords": found,
-                        "snippet": text[max(0, pos - 120) : pos + 500],
+                        "line_start": s + 1,
+                        "line_end": e + 1,
+                        "snippet": snippet,
                     }
                 )
-        return hits
+
+            # Simple score: term coverage + density of matched lines.
+            score = len(matched_terms) / max(len(terms), 1) + len(matched_indices) * 0.1
+            public = doc_record_to_public_dict(row)
+            hits.append(
+                {
+                    **public,
+                    "score": round(score, 3),
+                    "matched_keywords": sorted(matched_terms),
+                    "matches": matches[:3],
+                }
+            )
+        hits.sort(key=lambda x: x["score"], reverse=True)
+        return hits[:limit]
 
 
 @dataclass
 class ReadDocTool(_Tool):
     name: str = "read_doc"
-    description: str = "通过 search 工具返回的 file_path 安全分页读取正文。"
+    description: str = (
+        "通过 search/grep 工具返回的 file_path 安全读取正文。"
+        "支持按字符分页（offset/limit）或按行号范围（start_line/end_line）读取。"
+    )
     parameters: dict = field(
         default_factory=lambda: {
             "type": "object",
@@ -93,16 +185,40 @@ class ReadDocTool(_Tool):
                 "file_path": {"type": "string"},
                 "offset": {"type": "integer", "default": 0},
                 "limit": {"type": "integer", "default": 12000},
+                "start_line": {
+                    "type": "integer",
+                    "description": "与 end_line 配合时按行号读取，优先级高于 offset",
+                },
+                "end_line": {"type": "integer"},
+                "context_lines": {"type": "integer", "default": 0},
             },
             "required": ["file_path"],
         }
     )
 
     async def _run(
-        self, file_path: str, offset: int = 0, limit: int = 12000, **_
+        self,
+        file_path: str,
+        offset: int = 0,
+        limit: int = 12000,
+        start_line: int | None = None,
+        end_line: int | None = None,
+        context_lines: int = 0,
+        **_,
     ) -> dict:
         try:
-            result = read_document_content(self.docs_root, file_path, offset, limit)
+            if start_line is not None or end_line is not None:
+                result = read_document_lines(
+                    self.docs_root,
+                    file_path,
+                    start_line=start_line or 0,
+                    end_line=end_line,
+                    context_lines=context_lines,
+                )
+            else:
+                result = read_document_content(
+                    self.docs_root, file_path, offset, limit
+                )
         except ValueError as exc:
             return {"error": str(exc), "file_path": file_path}
         if self.tracker:

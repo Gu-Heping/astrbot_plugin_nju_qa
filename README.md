@@ -29,6 +29,7 @@ namespace 是语雀文档 URL `https://www.yuque.com/<namespace>/<slug>` 中的 
 | `yuque_base_url` | 否 | 默认 `https://www.yuque.com/api/v2`。 |
 | `yuque_repositories` | 是 | 仅这些指定知识库会被同步。 |
 | `embedding_api_key` / `embedding_base_url` / `embedding_model` | 否 | OpenAI-compatible Embedding；为空时仍可关键词检索。 |
+| `enable_vector_search` | 否 | 默认 `true`；设为 `false` 可关闭联网向量检索，完全使用本地 grep/关键词，响应更快。 |
 | `chunk_size` | 否 | 单个 chunk 目标字符数，默认 `1200`，最小 `200`。 |
 | `chunk_overlap` | 否 | 相邻 chunk 重叠字符数，默认 `180`。 |
 | `wake_words` | 否 | 默认 `南大助手,南小答,nju`。 |

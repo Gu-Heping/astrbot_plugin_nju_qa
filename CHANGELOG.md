@@ -12,9 +12,13 @@
 - Agent 关键步骤日志：provider、检索源数量、可靠源数量、grounding 源数量、引用数量。
 - 输出 Markdown 转纯文本：所有命令和普通消息回复在发送前都会去掉 Markdown 标记（标题、加粗、代码块、图片、链接、表格等），适配 QQ 个人号聊天页的纯文本显示。
 - Agent 自我介绍中自然包含“由 NOVA 开发”说明，用于社团宣传且不干扰正常问答。
+- `grep_local_docs` 改为逐行扫描本地 Markdown，返回匹配行号与上下文片段；`read_doc` 新增 `start_line`/`end_line` 参数，可按行号精确读取。
+- 新增配置项 `enable_vector_search`：可在 `config.yaml` 中关闭向量检索，完全依赖本地关键词/grep 检索以加快响应。
 
 ### Changed
 
+- 同步阶段即调用 `clean_document_body` 清洗 Yuque HTML 标签、Markdown 图片等噪声，chunk 索引和本地文件均基于干净文本，行号与 grep 结果一致。
+- Agent 提示词明确检索优先级：具体事实问题优先使用 `grep_local_docs` 并按行号精读，向量检索仅作为兜底；同时加强对 QA 知识库的利用。
 - 针对“详细整理/汇总/全面介绍”类问题，Agent 必须拆分为 2-4 个子主题分别检索，避免单次检索覆盖不全。
 - 引用来源限制为最多 5 条，减少答案被大量来源淹没的情况。
 - Grounding 材料来源上限从 5 提升到 7，优先保证事实性问题有足够依据。
