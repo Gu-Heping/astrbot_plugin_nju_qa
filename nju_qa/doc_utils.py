@@ -29,9 +29,16 @@ def clean_document_body(body: str, *, preserve_paragraphs: bool = False) -> str:
     body = strip_meta_table(parse_frontmatter(body)[1])
     # Drop markdown images entirely.
     body = re.sub(r"!\[.*?\]\(.*?\)", "", body)
-    # Keep both link text and URL.
+    # Keep both link text and URL for Markdown links.
     body = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", body)
-    # Drop HTML tags (including Yuque font/color spans).
+    # Preserve HTML anchor links as "text (url)" before stripping other tags.
+    body = re.sub(
+        r"<a\s+[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>",
+        r"\2 (\1)",
+        body,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    # Drop remaining HTML tags (including Yuque font/color spans).
     body = re.sub(r"<[^>]+>", "", body)
     if preserve_paragraphs:
         # Collapse horizontal whitespace inside each paragraph but keep paragraph

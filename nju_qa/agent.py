@@ -43,6 +43,15 @@ class SourceTracker:
             if item.document.yuque_id not in known:
                 self.sources.append(item)
                 known.add(item.document.yuque_id)
+            # URLs appearing in retrieved snippets are also considered verified,
+            # so the model can cite inline links from the knowledge base.
+            content = (
+                item.chunk.content_snippet
+                if item.chunk
+                else item.document.body
+            )
+            if content:
+                self.record_read_content(content)
 
 
 def _is_pure_no_evidence(text: str) -> bool:
