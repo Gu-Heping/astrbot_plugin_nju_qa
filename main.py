@@ -130,16 +130,20 @@ class NjuQaPlugin(Star):
 
     @filter.command("nju")
     async def nju(self, event: AstrMessageEvent, question: str = ""):
+        # AstrBot strips the leading '/' from event.message_str for commands.
+        text = (getattr(event, "message_str", None) or "").strip() or (
+            "nju " + question
+        ).strip()
+        # Ignore command messages that are not actually /nju (some AstrBot builds
+        # may route all slash commands to every command handler).
+        if not re.match(r"^nju(\s+.*)?$", text, re.IGNORECASE):
+            return
         mark_command_handled(event)
         rl_state = self._check_rate_limit(event)
         if rl_state:
             if not rl_state.silent:
                 yield _plain(event, self._rate_limit_message(rl_state))
             return
-        # AstrBot strips the leading '/' from event.message_str for commands.
-        text = (getattr(event, "message_str", None) or "").strip() or (
-            "nju " + question
-        ).strip()
 
         source_match = re.match(r"^nju\s+source\s+(.+)$", text, re.IGNORECASE)
         if source_match:
@@ -178,8 +182,10 @@ class NjuQaPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def nju_debug(self, event: AstrMessageEvent, question: str = ""):
         """Diagnostic command to inspect how AstrBot parses /nju messages."""
-        mark_command_handled(event)
         text = (getattr(event, "message_str", None) or "").strip()
+        if not text.lower().startswith("nju_debug"):
+            return
+        mark_command_handled(event)
         source_re = r"^nju\s+source\s+"
         matched = bool(re.match(source_re, text, re.IGNORECASE))
         yield _plain(event,
@@ -190,6 +196,9 @@ class NjuQaPlugin(Star):
 
     @filter.command("nju_grep")
     async def nju_grep(self, event: AstrMessageEvent, keywords: str = ""):
+        text = (getattr(event, "message_str", None) or "").strip()
+        if not text.lower().startswith("nju_grep"):
+            return
         mark_command_handled(event)
         rl_state = self._check_rate_limit(event)
         if rl_state:
@@ -225,6 +234,9 @@ class NjuQaPlugin(Star):
     @filter.command("nju_sync")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def nju_sync(self, event: AstrMessageEvent, action: str = ""):
+        text = (getattr(event, "message_str", None) or "").strip()
+        if not text.lower().startswith("nju_sync"):
+            return
         mark_command_handled(event)
         if action.lower() == "status":
             yield _plain(event,self.syncer.status_text())
@@ -240,6 +252,9 @@ class NjuQaPlugin(Star):
     @filter.command("nju_index")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def nju_index(self, event: AstrMessageEvent, action: str = ""):
+        text = (getattr(event, "message_str", None) or "").strip()
+        if not text.lower().startswith("nju_index"):
+            return
         mark_command_handled(event)
         if action.lower() != "rebuild":
             yield _plain(event,"用法：/nju_index rebuild")
@@ -257,6 +272,9 @@ class NjuQaPlugin(Star):
     @filter.command("nju_search")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def nju_search(self, event: AstrMessageEvent, query: str = ""):
+        text = (getattr(event, "message_str", None) or "").strip()
+        if not text.lower().startswith("nju_search"):
+            return
         mark_command_handled(event)
         if not query.strip():
             yield _plain(event,"用法：/nju_search <查询词>")

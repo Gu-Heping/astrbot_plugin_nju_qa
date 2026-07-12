@@ -31,7 +31,7 @@
 - 修复 `grep_local_docs` 对长中文关键词无法命中时的兜底检索逻辑。
 - 修复 `search_knowledge_base` 返回片段和 `read_doc` / `get_doc_details` 正文中残留 Yuque HTML 标签、Markdown 图片、颜色字体等未清洗内容的问题。
 - 修复与其他插件（如 `astrbot_plugin_nju_qq_audit`）的 `/` 指令冲突：本插件的 `on_message` 现在会检查原始消息文本，若真实内容以 `/` 开头则不再当作普通提问处理。
-- 修复 `main.py` 中 `_plain()` 辅助函数因批量替换而递归调用自身导致的 `RecursionError`。
+- 修复所有命令 handler 在部分 AstrBot 环境下会响应任意 / 指令的问题：每个 handler 现在先校验 event.message_str 是否以自身命令名开头，不匹配时直接返回，不再占用事件或输出内容。
 - 修复 `DocumentStore.path_for()` 改为返回相对路径后，重复文档名去重失效的问题。
 
 ## [0.1.0] - 2026-07-11

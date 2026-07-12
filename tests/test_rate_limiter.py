@@ -288,3 +288,47 @@ def test_admin_commands_are_not_rate_limited(plugin_class, tmp_path):
     debug_event = _FakeEvent(group_id="g1", text="nju_debug")
     result = asyncio.run(_collect(plugin.nju_debug(debug_event)))
     assert "message_str" in result[0]
+
+
+def test_nju_handler_ignores_other_commands(plugin_class, tmp_path):
+    plugin = _make_plugin(plugin_class, tmp_path)
+    event = _FakeEvent(group_id="g1", text="audit ok")
+    result = asyncio.run(_collect(plugin.nju(event)))
+    assert result == []
+    assert not event.stopped
+
+
+def test_nju_grep_handler_ignores_other_commands(plugin_class, tmp_path):
+    plugin = _make_plugin(plugin_class, tmp_path)
+    event = _FakeEvent(group_id="g1", text="nju source 宿舍")
+    result = asyncio.run(_collect(plugin.nju_grep(event)))
+    assert result == []
+    assert not event.stopped
+
+
+def test_admin_handlers_ignores_other_commands(plugin_class, tmp_path):
+    plugin = _make_plugin(plugin_class, tmp_path)
+
+    sync_event = _FakeEvent(group_id="g1", text="nju_index rebuild")
+    assert asyncio.run(_collect(plugin.nju_sync(sync_event))) == []
+    assert not sync_event.stopped
+
+    index_event = _FakeEvent(group_id="g1", text="nju_search test")
+    assert asyncio.run(_collect(plugin.nju_index(index_event))) == []
+    assert not index_event.stopped
+
+    search_event = _FakeEvent(group_id="g1", text="nju_debug")
+    assert asyncio.run(_collect(plugin.nju_search(search_event))) == []
+    assert not search_event.stopped
+
+    debug_event = _FakeEvent(group_id="g1", text="nju_sync")
+    assert asyncio.run(_collect(plugin.nju_debug(debug_event))) == []
+    assert not debug_event.stopped
+
+
+def test_nju_handler_does_not_swallow_nju_grep(plugin_class, tmp_path):
+    plugin = _make_plugin(plugin_class, tmp_path)
+    event = _FakeEvent(group_id="g1", text="nju_grep 宿舍")
+    result = asyncio.run(_collect(plugin.nju(event)))
+    assert result == []
+    assert not event.stopped
