@@ -39,7 +39,9 @@ namespace 是语雀文档 URL `https://www.yuque.com/<namespace>/<slug>` 中的 
 | `group_rate_limit_window` | 否 | 群聊限流窗口秒数，默认 `3600`（1 小时）。 |
 | `private_rate_limit` | 否 | 私聊每小时最多响应次数，默认 `20`，`0` 表示不限。 |
 | `private_rate_limit_window` | 否 | 私聊限流窗口秒数，默认 `3600`（1 小时）。 |
-| `render_tables_as_images` | 否 | 将回答中的 Markdown 表格渲染为图片插入回复，默认 `true`。需要系统装有中文字体。 |
+| `render_tables_as_images` | 否 | 将回答中的 Markdown 表格渲染为图片插入回复，默认 `true`。 |
+| `table_font_path` | 否 | 表格图片使用的字体文件绝对路径；留空则自动搜索系统字体。 |
+| `auto_download_table_font` | 否 | 未找到系统字体时自动下载开源中文字体（Noto Sans CJK SC，约 8 MB），默认 `true`。 |
 
 首次使用：配置完成后执行 `/nju_sync`，待完成后使用 `/nju_sync status`。同步会自动切分文档并建立可选的向量索引。
 
@@ -59,7 +61,7 @@ namespace 是语雀文档 URL `https://www.yuque.com/<namespace>/<slug>` 中的 
 
 `/nju`、`/nju_grep` 和普通消息触发的回答会按聊天上下文限流：群聊超过配置次数后首次提示大家私聊提问，之后在同一限流窗口内不再回复；私聊超过次数后首次提示稍后再试，之后不再回复。管理员命令不受限流影响。
 
-当回答包含 Markdown 表格时，默认会将表格渲染为一张 PNG 图片并插入到回复中；无表格时仍按纯文本输出。可在配置中关闭 `render_tables_as_images`。
+当回答包含 Markdown 表格时，默认会将表格渲染为一张 PNG 图片并插入到回复中；无表格时仍按纯文本输出。插件初始化时会优先使用 `table_font_path`，其次搜索系统字体；如果仍未找到且 `auto_download_table_font` 开启，会自动下载 Noto Sans CJK SC（约 8 MB）到插件数据目录。可在配置中关闭 `render_tables_as_images` 或 `auto_download_table_font`。
 
 ## 检索架构
 

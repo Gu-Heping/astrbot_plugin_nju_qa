@@ -21,7 +21,7 @@ from .nju_qa.rate_limiter import RateLimiter, RateLimitState
 from .nju_qa.retriever import HybridRetriever
 from .nju_qa.routing import MessageRouter, mark_command_handled
 from .nju_qa.sync_service import SyncService
-from .nju_qa.table_renderer import clean_table_images, render_tables_as_images
+from .nju_qa.table_renderer import clean_table_images, ensure_cjk_font, render_tables_as_images
 from .nju_qa.tools import (
     GetDocDetailsTool,
     DocStatsTool,
@@ -70,7 +70,9 @@ class NjuQaPlugin(Star):
         data_dir = Path(
             getattr(self, "data_dir", Path("data") / "astrbot_plugin_nju_qa")
         )
+        self._data_dir = data_dir
         self._table_image_dir = data_dir / "table_images"
+        self._resolved_font_path: str | None = None
         self.store = DocumentStore(data_dir / "documents")
         self.index = DocumentIndex(data_dir / "nju_qa.sqlite3")
         self.chunk_store = ChunkStore(data_dir / "chunks.sqlite3")
@@ -141,6 +143,11 @@ class NjuQaPlugin(Star):
         self.index.open()
         self.chunk_store.open()
         clean_table_images(self._table_image_dir)
+        self._resolved_font_path = await ensure_cjk_font(
+            self._data_dir,
+            self.config.table_font_path or None,
+            self.config.auto_download_table_font,
+        )
 
     async def _sync(self) -> str:
         result = await self.syncer.sync_all()
@@ -362,7 +369,7 @@ class NjuQaPlugin(Star):
         """Return plain text or a text+image chain if the answer contains tables."""
         if not self.config.render_tables_as_images:
             return _plain(event, text)
-        font_path = self.config.table_font_path or None
+        font_path = self.config.table_font_path or self._resolved_font_path
         segments = render_tables_as_images(text, self._table_image_dir, font_path=font_path)
         return _build_rich_result(event, segments)
 

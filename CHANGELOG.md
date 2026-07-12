@@ -13,7 +13,8 @@
 - 输出 Markdown 转纯文本：所有命令和普通消息回复在发送前都会去掉 Markdown 标记（标题、加粗、代码块、图片、链接、表格等），适配 QQ 个人号聊天页的纯文本显示。
 - Agent 自我介绍中自然包含“由 NOVA 开发”说明，用于社团宣传且不干扰正常问答。
 - `grep_local_docs` 改为逐行扫描本地 Markdown，返回匹配行号与上下文片段；`read_doc` 新增 `start_line`/`end_line` 参数，可按行号精确读取。
-- 新增 `render_tables_as_images` 配置：回答中的 Markdown 表格会被渲染为 PNG 图片并插入到消息链中，便于 QQ 等纯文本环境阅读。
+- 新增 `table_font_path` 配置：可显式指定表格图片使用的中文字体文件。
+- 新增 `auto_download_table_font` 配置：未找到可用系统字体时，自动下载开源 Noto Sans CJK SC 字体到插件数据目录，避免表格图片出现乱码；下载失败时仍自动回退为纯文本表格。
 - 新增按聊天上下文限流：`group_rate_limit` / `private_rate_limit` 及对应窗口配置，限制 `/nju`、`/nju_grep` 和普通消息触发的回答频率；群聊达到上限后首次鼓励私聊提问，私聊达到上限后首次提示稍后再试，之后同一窗口内不再重复回复。管理员命令不受限流影响。
 
 ### Changed

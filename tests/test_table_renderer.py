@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from nju_qa.table_renderer import (
     _extract_table_blocks,
+    _find_font_path,
     _is_separator_row,
+    _is_valid_font,
     _parse_row,
     _render_table_image,
+    ensure_cjk_font,
     render_tables_as_images,
 )
 
@@ -105,3 +109,64 @@ def test_render_tables_as_images_handles_multiple_tables(tmp_path):
     assert len(images) == 2
     for _, path in images:
         assert Path(path).exists()
+
+
+def test_find_font_path_prefers_configured_path(tmp_path, monkeypatch):
+    font_file = tmp_path / "custom.ttf"
+    font_file.write_bytes(b"dummy")
+    monkeypatch.setattr("nju_qa.table_renderer._is_valid_font", lambda path: True)
+    assert _find_font_path(str(font_file)) == str(font_file)
+
+
+def test_ensure_cjk_font_returns_configured_path(tmp_path, monkeypatch):
+    font_file = tmp_path / "configured.ttf"
+    font_file.write_bytes(b"dummy")
+    monkeypatch.setattr("nju_qa.table_renderer._is_valid_font", lambda path: True)
+    result = asyncio.run(
+        ensure_cjk_font(tmp_path, configured_font_path=str(font_file))
+    )
+    assert result == str(font_file)
+
+
+def test_ensure_cjk_font_downloads_when_allowed(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr("nju_qa.table_renderer._find_font_path", lambda font_path=None: None)
+    monkeypatch.setattr("nju_qa.table_renderer._is_valid_font", lambda path: True)
+
+    async def fake_download(url, dest, timeout=120.0):
+        calls.append(url)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"font")
+        return True
+
+    monkeypatch.setattr("nju_qa.table_renderer._download_font", fake_download)
+    result = asyncio.run(ensure_cjk_font(tmp_path, allow_download=True))
+    assert result is not None
+    assert Path(result).name == "NotoSansCJKsc-Regular.otf"
+    assert len(calls) >= 1
+
+
+def test_ensure_cjk_font_skips_download_when_disabled(tmp_path, monkeypatch):
+    monkeypatch.setattr("nju_qa.table_renderer._find_font_path", lambda font_path=None: None)
+    result = asyncio.run(ensure_cjk_font(tmp_path, allow_download=False))
+    assert result is None
+
+
+def test_is_valid_font_rejects_invalid_file(tmp_path):
+    bad_file = tmp_path / "not_a_font.txt"
+    bad_file.write_text("hello")
+    assert _is_valid_font(bad_file) is False
+
+
+def test_config_parses_font_fields():
+    from nju_qa.config import PluginConfig
+
+    config = PluginConfig.from_mapping(
+        {
+            "yuque_repositories": ["nju/guide"],
+            "table_font_path": "/tmp/font.ttf",
+            "auto_download_table_font": False,
+        }
+    )
+    assert config.table_font_path == "/tmp/font.ttf"
+    assert config.auto_download_table_font is False

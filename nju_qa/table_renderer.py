@@ -2,28 +2,48 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
 import uuid
 from pathlib import Path
 from typing import Any
 
 
-def _find_font(size: int, font_path: str | None = None):
-    """Return a Pillow ImageFont using a system CJK font if available.
+logger = logging.getLogger(__name__)
 
-    Returns ``None`` when no usable CJK font is found, so callers can fall
-    back to plain text instead of producing tofu.
-    """
+# Noto Sans CJK Simplified Chinese Regular is licensed under the SIL Open Font
+# License 1.1. These URLs are tried in order until one succeeds.
+_CJK_FONT_URLS = [
+    "https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf",
+    "https://gitee.com/mirrors/noto-cjk/raw/main/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf",
+]
+_FONT_FILE_NAME = "NotoSansCJKsc-Regular.otf"
+_FONT_LOCK = asyncio.Lock()
+
+
+def _is_valid_font(path: str | Path) -> bool:
+    """Return True if Pillow can load the given font file."""
     try:
         from PIL import ImageFont
-    except ImportError as exc:  # pragma: no cover
-        raise RuntimeError("Pillow is required for table rendering") from exc
 
+        ImageFont.truetype(str(path), 12)
+        return True
+    except Exception:
+        return False
+
+
+def _find_font_path(font_path: str | None = None) -> str | None:
+    """Return the path to a usable CJK font file, or ``None``.
+
+    If ``font_path`` is provided and points to a valid file, it is returned.
+    Otherwise the function searches common system font locations and, if
+    Matplotlib is installed, scans the system font list for CJK fonts.
+    """
     if font_path:
-        try:
-            return ImageFont.truetype(font_path, size)
-        except Exception:
-            pass
+        candidate = Path(font_path)
+        if candidate.is_file() and _is_valid_font(candidate):
+            return str(candidate)
 
     candidates = [
         # Windows common Chinese fonts
@@ -38,7 +58,6 @@ def _find_font(size: int, font_path: str | None = None):
         "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-VF.ttf.ttc",
         # Linux: WenQuanYi
         "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
@@ -56,29 +75,61 @@ def _find_font(size: int, font_path: str | None = None):
         "/Library/Fonts/Arial Unicode.ttf",
     ]
     for path in candidates:
-        try:
-            return ImageFont.truetype(path, size)
-        except Exception:
-            continue
+        if Path(path).is_file() and _is_valid_font(path):
+            return path
 
     # Optional: let Matplotlib scan the system font list for CJK fonts.
     try:
         from matplotlib import font_manager as fm
 
-        cjk_keywords = ("cjk", "hei", "song", "ming", "noto", "wqy", "source han",
-                        "han sans", "microsoft yahei", "pingfang", "heiti", "黑体",
-                        "宋体", "明体", "思源")
+        cjk_keywords = (
+            "cjk",
+            "hei",
+            "song",
+            "ming",
+            "noto",
+            "wqy",
+            "source han",
+            "han sans",
+            "microsoft yahei",
+            "pingfang",
+            "heiti",
+            "黑体",
+            "宋体",
+            "明体",
+            "思源",
+        )
         for path in fm.findSystemFonts():
             try:
                 prop = fm.FontProperties(fname=path)
                 name = (prop.get_name() or "").lower()
-                if any(k in name for k in cjk_keywords):
-                    return ImageFont.truetype(path, size)
+                if any(k in name for k in cjk_keywords) and _is_valid_font(path):
+                    return path
             except Exception:
                 continue
     except Exception:
         pass
 
+    return None
+
+
+def _find_font(size: int, font_path: str | None = None):
+    """Return a Pillow ImageFont using a system CJK font if available.
+
+    Returns ``None`` when no usable CJK font is found, so callers can fall
+    back to plain text instead of producing tofu.
+    """
+    try:
+        from PIL import ImageFont
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError("Pillow is required for table rendering") from exc
+
+    path = _find_font_path(font_path)
+    if path:
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            pass
     return None
 
 
@@ -90,6 +141,79 @@ def _has_cjk(text: str) -> bool:
         or "＀" <= char <= "￯"
         for char in text
     )
+
+
+async def _download_font(url: str, dest: Path, timeout: float = 120.0) -> bool:
+    """Download a font file to ``dest`` and return True if it is valid."""
+    try:
+        import httpx
+    except ImportError:  # pragma: no cover
+        logger.warning("httpx is required to download fonts automatically")
+        return False
+
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
+            async with client.stream("GET", url) as response:
+                response.raise_for_status()
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                with dest.open("wb") as f:
+                    async for chunk in response.aiter_bytes(chunk_size=8192):
+                        f.write(chunk)
+        return _is_valid_font(dest)
+    except Exception as exc:
+        logger.warning("Failed to download font from %s: %s", url, exc)
+        try:
+            dest.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+
+
+async def ensure_cjk_font(
+    data_dir: Path,
+    configured_font_path: str | None = None,
+    allow_download: bool = True,
+) -> str | None:
+    """Return a usable CJK font path, downloading one if necessary and allowed.
+
+    Resolution order:
+    1. ``configured_font_path`` if it is a valid font file.
+    2. Any CJK font found on the system.
+    3. A downloaded Noto Sans CJK SC font saved under ``data_dir/fonts``.
+    4. ``None`` (callers should fall back to plain text).
+    """
+    if configured_font_path:
+        candidate = Path(configured_font_path)
+        if candidate.is_file() and _is_valid_font(candidate):
+            return str(candidate)
+        logger.warning("Configured font not found or invalid: %s", configured_font_path)
+
+    system_path = _find_font_path()
+    if system_path:
+        return system_path
+
+    if not allow_download:
+        return None
+
+    font_dir = data_dir / "fonts"
+    dest = font_dir / _FONT_FILE_NAME
+    if dest.is_file() and _is_valid_font(dest):
+        return str(dest)
+
+    async with _FONT_LOCK:
+        # Double-check after acquiring the lock.
+        if dest.is_file() and _is_valid_font(dest):
+            return str(dest)
+        for url in _CJK_FONT_URLS:
+            logger.info("Downloading CJK font from %s ...", url)
+            if await _download_font(url, dest):
+                logger.info("CJK font saved to %s", dest)
+                return str(dest)
+
+    logger.warning(
+        "Could not download a CJK font; table images will fall back to plain text"
+    )
+    return None
 
 
 def _is_table_row(line: str) -> bool:
