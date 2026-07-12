@@ -133,7 +133,8 @@ class NjuQaPlugin(Star):
         mark_command_handled(event)
         rl_state = self._check_rate_limit(event)
         if rl_state:
-            yield _plain(event, self._rate_limit_message(rl_state))
+            if not rl_state.silent:
+                yield _plain(event, self._rate_limit_message(rl_state))
             return
         # AstrBot strips the leading '/' from event.message_str for commands.
         text = (getattr(event, "message_str", None) or "").strip() or (
@@ -192,7 +193,8 @@ class NjuQaPlugin(Star):
         mark_command_handled(event)
         rl_state = self._check_rate_limit(event)
         if rl_state:
-            yield _plain(event, self._rate_limit_message(rl_state))
+            if not rl_state.silent:
+                yield _plain(event, self._rate_limit_message(rl_state))
             return
         if not keywords.strip():
             yield _plain(event,"用法：/nju_grep <空格分隔的关键词>")
@@ -280,7 +282,8 @@ class NjuQaPlugin(Star):
         mark_command_handled(event)
         rl_state = self._check_rate_limit(event)
         if rl_state:
-            yield _plain(event, self._rate_limit_message(rl_state))
+            if not rl_state.silent:
+                yield _plain(event, self._rate_limit_message(rl_state))
             return
         try:
             yield _plain(event,await self.agent.answer(event, routed.query))

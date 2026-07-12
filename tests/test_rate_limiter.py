@@ -27,10 +27,35 @@ def test_denies_after_max_count():
     limiter.is_allowed("g1", is_group=True)
     allowed, state = limiter.is_allowed("g1", is_group=True)
     assert allowed is False
+    assert state.silent is False
     assert state.current_count == 2
     assert state.max_count == 2
     assert state.reset_after_seconds > 0
     assert state.is_group is True
+
+
+def test_subsequent_blocked_requests_are_silent():
+    limiter = RateLimiter(group_max=1, group_window_seconds=3600)
+    limiter.is_allowed("g1", is_group=True)
+    _, first_block = limiter.is_allowed("g1", is_group=True)
+    assert first_block.allowed is False and first_block.silent is False
+    _, second_block = limiter.is_allowed("g1", is_group=True)
+    assert second_block.allowed is False and second_block.silent is True
+
+
+def test_reminder_resets_after_window(monkeypatch):
+    limiter = RateLimiter(group_max=1, group_window_seconds=60)
+    now = [0.0]
+    monkeypatch.setattr("nju_qa.rate_limiter.time.monotonic", lambda: now[0])
+    limiter.is_allowed("g1", is_group=True)
+    now[0] = 30.0
+    _, block = limiter.is_allowed("g1", is_group=True)
+    assert block.silent is False
+    now[0] = 61.0
+    assert limiter.is_allowed("g1", is_group=True)[0] is True
+    now[0] = 62.0
+    _, block2 = limiter.is_allowed("g1", is_group=True)
+    assert block2.allowed is False and block2.silent is False
 
 
 def test_independent_tracking_per_key():
@@ -206,6 +231,10 @@ def test_group_handler_blocks_after_limit(plugin_class, tmp_path):
     assert "本群已达到当前时段的提问上限" in third[0]
     assert "私聊" in third[0]
 
+    # After the first reminder, further requests in the same window are silent.
+    fourth = asyncio.run(_collect(plugin.nju(_FakeEvent(group_id="g1", text="nju again"))))
+    assert fourth == []
+
 
 def test_private_handler_blocks_after_limit(plugin_class, tmp_path):
     plugin = _make_plugin(plugin_class, tmp_path, private_limit=2)
@@ -216,6 +245,11 @@ def test_private_handler_blocks_after_limit(plugin_class, tmp_path):
         _collect(plugin.nju(_FakeEvent(group_id="", sender_id="u1", text="nju c")))
     )
     assert "你已达到当前时段的提问上限" in third[0]
+
+    fourth = asyncio.run(
+        _collect(plugin.nju(_FakeEvent(group_id="", sender_id="u1", text="nju d")))
+    )
+    assert fourth == []
 
 
 def test_nju_grep_counts_toward_group_limit(plugin_class, tmp_path):

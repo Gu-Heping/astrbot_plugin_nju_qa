@@ -16,13 +16,16 @@ class RateLimitState:
     window_seconds: int
     reset_after_seconds: int
     is_group: bool
+    silent: bool = False
 
 
 class RateLimiter:
     """Track how many answers have been sent to a chat context in a window.
 
     ``max_count == 0`` or ``window_seconds == 0`` disables limiting for that
-    chat type.  Timestamps are stored in memory and are lost on restart.
+    chat type.  Timestamps are stored in memory and are lost on restart.  Once
+    the limit is reached, only the first blocked request in that window gets a
+    reminder; subsequent blocked requests are marked ``silent``.
     """
 
     def __init__(
@@ -37,6 +40,7 @@ class RateLimiter:
         self.private_max = max(0, int(private_max))
         self.private_window_seconds = max(0, int(private_window_seconds))
         self._buckets: dict[str, deque[float]] = {}
+        self._reminded: set[str] = set()
 
     def is_allowed(self, chat_key: str, is_group: bool) -> tuple[bool, RateLimitState]:
         max_count = self.group_max if is_group else self.private_max
@@ -50,17 +54,24 @@ class RateLimiter:
         cutoff = now - window
         while timestamps and timestamps[0] <= cutoff:
             timestamps.popleft()
+        if not timestamps:
+            self._reminded.discard(chat_key)
 
         if len(timestamps) < max_count:
             timestamps.append(now)
+            self._reminded.discard(chat_key)
             return True, RateLimitState(
                 True, len(timestamps), max_count, window, 0, is_group
             )
 
         reset_after = max(1, math.ceil(timestamps[0] + window - now))
+        silent = chat_key in self._reminded
+        if not silent:
+            self._reminded.add(chat_key)
         return False, RateLimitState(
-            False, len(timestamps), max_count, window, reset_after, is_group
+            False, len(timestamps), max_count, window, reset_after, is_group, silent
         )
 
     def reset(self) -> None:
         self._buckets.clear()
+        self._reminded.clear()
