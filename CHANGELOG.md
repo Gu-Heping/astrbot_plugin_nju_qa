@@ -24,6 +24,7 @@
 - 修复 `read_doc` / `get_doc_details` 因数据库中 `path` 列已包含 `docs_root` 前缀而报 `invalid document path` 的问题，并统一 `DocumentStore` 后续写入使用相对 `docs_root` 的路径。
 - 修复 `grep_local_docs` 对长中文关键词无法命中时的兜底检索逻辑。
 - 修复 `search_knowledge_base` 返回片段和 `read_doc` / `get_doc_details` 正文中残留 Yuque HTML 标签、Markdown 图片、颜色字体等未清洗内容的问题。
+- 修复与其他插件（如 `astrbot_plugin_nju_qq_audit`）的 `/` 指令冲突：本插件的 `on_message` 现在会检查原始消息文本，若真实内容以 `/` 开头则不再当作普通提问处理。
 
 ## [0.1.0] - 2026-07-11
 

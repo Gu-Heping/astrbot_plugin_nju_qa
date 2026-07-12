@@ -244,7 +244,13 @@ class NjuQaPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
-        original = event.message_str or ""
+        original = self._raw_message_text(event)
+        # AstrBot strips the leading '/' from event.message_str before command
+        # handlers run, so ALL-message listeners see "audit ok" instead of
+        # "/audit ok". Ignore raw command-like messages to avoid conflicting
+        # with other plugins (e.g. astrbot_plugin_nju_qq_audit).
+        if original.lstrip().startswith("/"):
+            return
         is_at_me = self._is_at_me(event)
         text = self._remove_at(event, original) if is_at_me else original
         routed = self.router.route(event, text, is_at_me)
@@ -256,6 +262,20 @@ class NjuQaPlugin(Star):
         except Exception:
             logger.exception("NJU QA message handling failed")
             yield event.plain_result("处理问题时出错，请稍后重试。")
+
+    @staticmethod
+    def _raw_message_text(event: AstrMessageEvent) -> str:
+        """Return the original plain text before AstrBot strips the command '/'."""
+        try:
+            from astrbot.api import message_components as comp
+
+            return "".join(
+                part.text
+                for part in event.message_obj.message
+                if isinstance(part, comp.Plain)
+            ).strip()
+        except (AttributeError, ImportError):
+            return (event.message_str or "").strip()
 
     @staticmethod
     def _format_sources(results) -> str:
