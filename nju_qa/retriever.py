@@ -78,7 +78,11 @@ class HybridRetriever:
     def _rebuild_keyword_index(self) -> None:
         if self.chunk_store is None:
             return
+        signature = self.chunk_store.content_signature()
+        if getattr(self, "_keyword_index_signature", None) == signature:
+            return
         self.keyword_index.build(self.chunk_store.all_chunks())
+        self._keyword_index_signature = signature
 
     async def _vector_candidates(
         self, query: str, top_k: int

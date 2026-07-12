@@ -1,6 +1,7 @@
 """Persistent SQLite store for chunk metadata used by keyword and vector indexes."""
 
 from __future__ import annotations
+import hashlib
 import sqlite3
 from pathlib import Path
 from .chunking import Chunk
@@ -131,6 +132,18 @@ class ChunkStore:
         conn = self._ensure_open()
         row = conn.execute("SELECT count(*) FROM chunks").fetchone()
         return row[0] if row else 0
+
+    def content_signature(self) -> str:
+        """Return a cheap fingerprint of the current chunk contents.
+
+        Used to invalidate in-memory keyword indexes without loading all content.
+        """
+        conn = self._ensure_open()
+        rows = conn.execute(
+            "SELECT content_hash FROM chunks ORDER BY chunk_id"
+        ).fetchall()
+        combined = "".join(row[0] for row in rows)
+        return hashlib.sha256(combined.encode("utf-8")).hexdigest()
 
     def document_chunk_count(self, document_id: str) -> int:
         conn = self._ensure_open()
