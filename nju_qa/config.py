@@ -22,6 +22,10 @@ class PluginConfig:
     score_threshold: float = 0.25
     chunk_size: int = 1200
     chunk_overlap: int = 180
+    group_rate_limit: int = 30
+    group_rate_limit_window: int = 3600
+    private_rate_limit: int = 20
+    private_rate_limit_window: int = 3600
 
     @classmethod
     def from_mapping(cls, raw: Any) -> "PluginConfig":
@@ -52,10 +56,18 @@ class PluginConfig:
         threshold = float(raw.get("score_threshold", 0.25))
         chunk_size = int(raw.get("chunk_size", 1200))
         chunk_overlap = int(raw.get("chunk_overlap", 180))
+        group_rate_limit = int(raw.get("group_rate_limit", 30))
+        group_rate_limit_window = int(raw.get("group_rate_limit_window", 3600))
+        private_rate_limit = int(raw.get("private_rate_limit", 20))
+        private_rate_limit_window = int(raw.get("private_rate_limit_window", 3600))
         if not 1 <= top_k <= 20 or not 0 <= threshold <= 1:
             raise ValueError("检索配置超出允许范围")
         if not 200 <= chunk_size <= 8000 or not 0 <= chunk_overlap < chunk_size // 2:
             raise ValueError("chunk 配置超出允许范围")
+        if not 0 <= group_rate_limit <= 1000 or not 0 <= private_rate_limit <= 1000:
+            raise ValueError("rate_limit 必须在 0 到 1000 之间")
+        if not 60 <= group_rate_limit_window <= 86400 or not 60 <= private_rate_limit_window <= 86400:
+            raise ValueError("rate_limit_window 必须在 60 到 86400 秒之间")
         return cls(
             str(raw.get("yuque_token", "")),
             base,
@@ -71,4 +83,8 @@ class PluginConfig:
             threshold,
             chunk_size,
             chunk_overlap,
+            group_rate_limit,
+            group_rate_limit_window,
+            private_rate_limit,
+            private_rate_limit_window,
         )

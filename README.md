@@ -35,6 +35,10 @@ namespace 是语雀文档 URL `https://www.yuque.com/<namespace>/<slug>` 中的 
 | `wake_words` | 否 | 默认 `南大助手,南小答,nju`。 |
 | `enable_private_chat` / `enable_group_at` | 否 | 私聊、群聊显式触发开关。 |
 | `retrieval_top_k` / `score_threshold` | 否 | 检索数量和阈值。 |
+| `group_rate_limit` | 否 | 群聊每小时最多响应次数，默认 `30`，`0` 表示不限。 |
+| `group_rate_limit_window` | 否 | 群聊限流窗口秒数，默认 `3600`（1 小时）。 |
+| `private_rate_limit` | 否 | 私聊每小时最多响应次数，默认 `20`，`0` 表示不限。 |
+| `private_rate_limit_window` | 否 | 私聊限流窗口秒数，默认 `3600`（1 小时）。 |
 
 首次使用：配置完成后执行 `/nju_sync`，待完成后使用 `/nju_sync status`。同步会自动切分文档并建立可选的向量索引。
 
@@ -51,6 +55,8 @@ namespace 是语雀文档 URL `https://www.yuque.com/<namespace>/<slug>` 中的 
 - `/nju_debug`：管理员查看 AstrBot 对 `/nju` 命令的解析结果（用于排查命令路由）。
 
 当材料不足时，机器人会明确回复“知识库中暂未找到可靠资料”。高风险或易变信息应以来源的更新时间和南京大学官方最新通知为准。
+
+`/nju`、`/nju_grep` 和普通消息触发的回答会按聊天上下文限流：群聊超过配置次数后会提示大家私聊提问，私聊超过次数后提示稍后再试。管理员命令不受限流影响。
 
 ## 检索架构
 

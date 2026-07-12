@@ -12,5 +12,9 @@
   "retrieval_top_k": {"description": "检索结果数", "type": "int", "default": 5},
   "score_threshold": {"description": "检索分数阈值", "type": "float", "default": 0.25},
   "chunk_size": {"description": "单个 chunk 目标字符数", "type": "int", "default": 1200},
-  "chunk_overlap": {"description": "相邻 chunk 重叠字符数", "type": "int", "default": 180}
+  "chunk_overlap": {"description": "相邻 chunk 重叠字符数", "type": "int", "default": 180},
+  "group_rate_limit": {"description": "群聊每小时最多响应次数，0 表示不限", "type": "int", "default": 30},
+  "group_rate_limit_window": {"description": "群聊限流窗口（秒）", "type": "int", "default": 3600},
+  "private_rate_limit": {"description": "私聊每小时最多响应次数，0 表示不限", "type": "int", "default": 20},
+  "private_rate_limit_window": {"description": "私聊限流窗口（秒）", "type": "int", "default": 3600}
 }

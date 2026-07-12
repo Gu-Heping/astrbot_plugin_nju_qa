@@ -7,7 +7,6 @@ from astrbot.api import FunctionTool
 from astrbot.api.event import AstrMessageEvent
 from ..doc_utils import (
     _load_cleaned_document_lines,
-    clean_document_body,
     doc_record_to_public_dict,
     parse_yuque_doc_url,
     read_document_content,

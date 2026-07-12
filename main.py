@@ -17,6 +17,7 @@ from .nju_qa.config import PluginConfig
 from .nju_qa.document_index import DocumentIndex
 from .nju_qa.document_store import DocumentStore
 from .nju_qa.formatting import markdown_to_plaintext
+from .nju_qa.rate_limiter import RateLimiter, RateLimitState
 from .nju_qa.retriever import HybridRetriever
 from .nju_qa.routing import MessageRouter, mark_command_handled
 from .nju_qa.sync_service import SyncService
@@ -107,6 +108,12 @@ class NjuQaPlugin(Star):
             self.config.enable_private_chat,
             self.config.enable_group_at,
         )
+        self.rate_limiter = RateLimiter(
+            group_max=self.config.group_rate_limit,
+            group_window_seconds=self.config.group_rate_limit_window,
+            private_max=self.config.private_rate_limit,
+            private_window_seconds=self.config.private_rate_limit_window,
+        )
         self._sync_task: asyncio.Task | None = None
         self._rebuild_task: asyncio.Task | None = None
 
@@ -124,6 +131,10 @@ class NjuQaPlugin(Star):
     @filter.command("nju")
     async def nju(self, event: AstrMessageEvent, question: str = ""):
         mark_command_handled(event)
+        rl_state = self._check_rate_limit(event)
+        if rl_state:
+            yield _plain(event, self._rate_limit_message(rl_state))
+            return
         # AstrBot strips the leading '/' from event.message_str for commands.
         text = (getattr(event, "message_str", None) or "").strip() or (
             "nju " + question
@@ -179,6 +190,10 @@ class NjuQaPlugin(Star):
     @filter.command("nju_grep")
     async def nju_grep(self, event: AstrMessageEvent, keywords: str = ""):
         mark_command_handled(event)
+        rl_state = self._check_rate_limit(event)
+        if rl_state:
+            yield _plain(event, self._rate_limit_message(rl_state))
+            return
         if not keywords.strip():
             yield _plain(event,"用法：/nju_grep <空格分隔的关键词>")
             return
@@ -263,6 +278,10 @@ class NjuQaPlugin(Star):
         if not routed.should_handle or not routed.query:
             return
         mark_command_handled(event)
+        rl_state = self._check_rate_limit(event)
+        if rl_state:
+            yield _plain(event, self._rate_limit_message(rl_state))
+            return
         try:
             yield _plain(event,await self.agent.answer(event, routed.query))
         except Exception:
@@ -293,6 +312,48 @@ class NjuQaPlugin(Star):
             for number, result in enumerate(results, 1)
         )
         return "\n".join(lines)
+
+    @staticmethod
+    def _chat_key(event: AstrMessageEvent) -> tuple[bool, str]:
+        """Return (is_group, key) for rate-limit tracking."""
+        group_id = ""
+        getter = getattr(event, "get_group_id", None)
+        if callable(getter):
+            group_id = getter() or ""
+        is_group = group_id not in (None, "")
+        if is_group:
+            return True, str(group_id)
+
+        sender_id = ""
+        sender_getter = getattr(event, "get_sender_id", None)
+        if callable(sender_getter):
+            sender_id = sender_getter() or ""
+        if sender_id:
+            return False, f"private:{sender_id}"
+
+        origin = getattr(event, "unified_msg_origin", "") or ""
+        if origin:
+            return False, f"private:{origin}"
+
+        return False, f"private:{id(event)}"
+
+    def _check_rate_limit(self, event: AstrMessageEvent) -> RateLimitState | None:
+        """Return RateLimitState only when the event is blocked."""
+        is_group, key = self._chat_key(event)
+        allowed, state = self.rate_limiter.is_allowed(key, is_group)
+        return None if allowed else state
+
+    @staticmethod
+    def _rate_limit_message(state: RateLimitState) -> str:
+        window_min = state.window_seconds // 60
+        if state.is_group:
+            return (
+                f"本群已达到当前时段的提问上限（{state.max_count} 次/{window_min} 分钟），"
+                "请稍后再试，或私聊我提问。"
+            )
+        return (
+            f"你已达到当前时段的提问上限（{state.max_count} 次/{window_min} 分钟），请稍后再试。"
+        )
 
     def _is_at_me(self, event: AstrMessageEvent) -> bool:
         try:

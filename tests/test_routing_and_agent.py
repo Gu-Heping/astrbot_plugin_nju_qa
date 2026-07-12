@@ -9,13 +9,17 @@ from nju_qa.routing import MessageRouter, mark_command_handled
 
 
 class Event:
-    def __init__(self, group_id=None):
+    def __init__(self, group_id=None, sender_id="tester"):
         self.group_id = group_id
+        self.sender_id = sender_id
         self.unified_msg_origin = "test:session"
         self.stop_calls = 0
 
     def get_group_id(self):
         return self.group_id
+
+    def get_sender_id(self):
+        return self.sender_id
 
     def stop_event(self):
         self.stop_calls += 1

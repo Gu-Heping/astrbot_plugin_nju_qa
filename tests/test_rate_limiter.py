@@ -1,0 +1,256 @@
+"""Tests for the in-memory sliding-window rate limiter."""
+
+from __future__ import annotations
+
+import asyncio
+import sys
+import types
+from pathlib import Path
+
+import pytest
+
+from nju_qa.config import PluginConfig
+from nju_qa.rate_limiter import RateLimiter
+
+
+def test_allows_up_to_max_count():
+    limiter = RateLimiter(group_max=3, group_window_seconds=3600)
+    for _ in range(3):
+        allowed, state = limiter.is_allowed("g1", is_group=True)
+        assert allowed is True
+        assert state.current_count <= 3
+
+
+def test_denies_after_max_count():
+    limiter = RateLimiter(group_max=2, group_window_seconds=3600)
+    limiter.is_allowed("g1", is_group=True)
+    limiter.is_allowed("g1", is_group=True)
+    allowed, state = limiter.is_allowed("g1", is_group=True)
+    assert allowed is False
+    assert state.current_count == 2
+    assert state.max_count == 2
+    assert state.reset_after_seconds > 0
+    assert state.is_group is True
+
+
+def test_independent_tracking_per_key():
+    limiter = RateLimiter(group_max=1, group_window_seconds=3600)
+    assert limiter.is_allowed("g1", is_group=True)[0] is True
+    assert limiter.is_allowed("g2", is_group=True)[0] is True
+    assert limiter.is_allowed("g1", is_group=True)[0] is False
+    assert limiter.is_allowed("g2", is_group=True)[0] is False
+
+
+def test_private_and_group_are_independent():
+    limiter = RateLimiter(
+        group_max=1,
+        group_window_seconds=3600,
+        private_max=1,
+        private_window_seconds=3600,
+    )
+    assert limiter.is_allowed("g1", is_group=True)[0] is True
+    assert limiter.is_allowed("private:u1", is_group=False)[0] is True
+    assert limiter.is_allowed("g1", is_group=True)[0] is False
+    assert limiter.is_allowed("private:u1", is_group=False)[0] is False
+
+
+def test_zero_max_disables_limiting():
+    limiter = RateLimiter(group_max=0, group_window_seconds=3600)
+    for _ in range(10):
+        assert limiter.is_allowed("g1", is_group=True)[0] is True
+
+
+def test_window_expires_old_entries(monkeypatch):
+    limiter = RateLimiter(group_max=1, group_window_seconds=60)
+    now = [0.0]
+    monkeypatch.setattr(
+        "nju_qa.rate_limiter.time.monotonic", lambda: now[0]
+    )
+    assert limiter.is_allowed("g1", is_group=True)[0] is True
+    now[0] = 30.0
+    assert limiter.is_allowed("g1", is_group=True)[0] is False
+    now[0] = 61.0
+    assert limiter.is_allowed("g1", is_group=True)[0] is True
+
+
+def test_reset_clears_state():
+    limiter = RateLimiter(group_max=1, group_window_seconds=3600)
+    limiter.is_allowed("g1", is_group=True)
+    limiter.reset()
+    assert limiter.is_allowed("g1", is_group=True)[0] is True
+
+
+def test_config_parses_rate_limit_fields():
+    config = PluginConfig.from_mapping(
+        {
+            "yuque_repositories": ["nju/guide"],
+            "group_rate_limit": 50,
+            "group_rate_limit_window": 1800,
+            "private_rate_limit": 10,
+            "private_rate_limit_window": 7200,
+        }
+    )
+    assert config.group_rate_limit == 50
+    assert config.group_rate_limit_window == 1800
+    assert config.private_rate_limit == 10
+    assert config.private_rate_limit_window == 7200
+
+
+def test_config_validates_rate_limit_ranges():
+    with pytest.raises(ValueError):
+        PluginConfig.from_mapping({"group_rate_limit": -1})
+    with pytest.raises(ValueError):
+        PluginConfig.from_mapping({"group_rate_limit": 2000})
+    with pytest.raises(ValueError):
+        PluginConfig.from_mapping({"group_rate_limit_window": 30})
+    with pytest.raises(ValueError):
+        PluginConfig.from_mapping({"private_rate_limit_window": 100000})
+
+
+@pytest.fixture(scope="module")
+def plugin_class():
+    """Dynamically load main.py as part of a temporary package.
+
+    This is necessary because main.py uses package-relative imports and is not
+    inside a regular Python package at the repository root.
+    """
+    pytest.importorskip("astrbot")
+    root = Path(__file__).parent.parent
+    parent = str(root.parent)
+    if parent not in sys.path:
+        sys.path.insert(0, parent)
+
+    pkg = types.ModuleType("astrbot_plugin_nju_qa")
+    pkg.__path__ = [str(root)]
+    sys.modules["astrbot_plugin_nju_qa"] = pkg
+
+    import nju_qa
+
+    sys.modules["astrbot_plugin_nju_qa.nju_qa"] = nju_qa
+
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "astrbot_plugin_nju_qa.main", root / "main.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["astrbot_plugin_nju_qa.main"] = mod
+    spec.loader.exec_module(mod)
+    return mod.NjuQaPlugin
+
+
+class _FakeAgent:
+    async def answer(self, event, prompt):
+        return f"答案：{prompt}"
+
+
+class _FakeEvent:
+    def __init__(self, group_id=None, sender_id="u1", text="nju test"):
+        self.group_id = group_id
+        self.sender_id = sender_id
+        self.message_str = text
+        self.unified_msg_origin = "test:session"
+        self.stopped = False
+
+    def get_group_id(self):
+        return self.group_id
+
+    def get_sender_id(self):
+        return self.sender_id
+
+    def get_self_id(self):
+        return "bot"
+
+    def stop_event(self):
+        self.stopped = True
+
+    def plain_result(self, text):
+        return text
+
+
+def _make_plugin(plugin_class, tmp_path, group_limit=2, private_limit=2):
+    class TestPlugin(plugin_class):
+        def __init__(self, data_dir, config):
+            self.data_dir = data_dir
+            super().__init__(context=object(), config=config)
+            self.agent = _FakeAgent()
+
+    config = PluginConfig.from_mapping(
+        {
+            "yuque_token": "x",
+            "yuque_repositories": ["nju/guide"],
+            "group_rate_limit": group_limit,
+            "group_rate_limit_window": 3600,
+            "private_rate_limit": private_limit,
+            "private_rate_limit_window": 3600,
+        }
+    )
+    return TestPlugin(tmp_path, config)
+
+
+async def _collect(generator):
+    return [item async for item in generator]
+
+
+def test_group_handler_blocks_after_limit(plugin_class, tmp_path):
+    plugin = _make_plugin(plugin_class, tmp_path, group_limit=2)
+    event = _FakeEvent(group_id="g1", text="nju hello")
+
+    first = asyncio.run(_collect(plugin.nju(event)))
+    assert "答案：hello" in first[0]
+
+    second = asyncio.run(_collect(plugin.nju(_FakeEvent(group_id="g1", text="nju hi"))))
+    assert "答案：hi" in second[0]
+
+    third = asyncio.run(_collect(plugin.nju(_FakeEvent(group_id="g1", text="nju hey"))))
+    assert "本群已达到当前时段的提问上限" in third[0]
+    assert "私聊" in third[0]
+
+
+def test_private_handler_blocks_after_limit(plugin_class, tmp_path):
+    plugin = _make_plugin(plugin_class, tmp_path, private_limit=2)
+
+    asyncio.run(_collect(plugin.nju(_FakeEvent(group_id="", sender_id="u1", text="nju a"))))
+    asyncio.run(_collect(plugin.nju(_FakeEvent(group_id="", sender_id="u1", text="nju b"))))
+    third = asyncio.run(
+        _collect(plugin.nju(_FakeEvent(group_id="", sender_id="u1", text="nju c")))
+    )
+    assert "你已达到当前时段的提问上限" in third[0]
+
+
+def test_nju_grep_counts_toward_group_limit(plugin_class, tmp_path):
+    plugin = _make_plugin(plugin_class, tmp_path, group_limit=1)
+    # nju_grep does not need a real index for the rate-limit guard.
+    event = _FakeEvent(group_id="g1", text="nju_grep 宿舍")
+    asyncio.run(_collect(plugin.nju_grep(event)))
+    # The first call is allowed; actual grep may fail because the index is empty,
+    # but the handler still consumes one group quota.
+    second = asyncio.run(
+        _collect(plugin.nju(_FakeEvent(group_id="g1", text="nju hey")))
+    )
+    assert "本群已达到当前时段的提问上限" in second[0]
+
+
+def test_admin_commands_are_not_rate_limited(plugin_class, tmp_path):
+    plugin = _make_plugin(plugin_class, tmp_path, group_limit=1)
+    # Consume the one group quota.
+    asyncio.run(_collect(plugin.nju(_FakeEvent(group_id="g1", text="nju q"))))
+
+    # Admin commands should still be allowed.
+    sync_event = _FakeEvent(group_id="g1", text="nju_sync")
+    result = asyncio.run(_collect(plugin.nju_sync(sync_event)))
+    assert "已启动后台同步" in result[0]
+
+    index_event = _FakeEvent(group_id="g1", text="nju_index rebuild")
+    result = asyncio.run(_collect(plugin.nju_index(index_event)))
+    assert "已启动后台索引重建" in result[0]
+
+    search_event = _FakeEvent(group_id="g1", text="nju_search test")
+    result = asyncio.run(_collect(plugin.nju_search(search_event)))
+    # nju_search may return "知识库为空" or a debug report; the point is it did not
+    # hit the rate-limit message.
+    assert "提问上限" not in result[0]
+
+    debug_event = _FakeEvent(group_id="g1", text="nju_debug")
+    result = asyncio.run(_collect(plugin.nju_debug(debug_event)))
+    assert "message_str" in result[0]
