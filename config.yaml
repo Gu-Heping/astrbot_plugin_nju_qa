@@ -1,0 +1,40 @@
+# 南京大学知识库问答插件配置模板
+# 把需要的项填入 AstrBot 的插件配置中，或直接重命名为 config.yaml 使用。
+
+# 语雀 API 读取 Token（只读即可，不要提交到 Git）
+yuque_token: ""
+
+# 语雀 API 地址
+yuque_base_url: "https://www.yuque.com/api/v2"
+
+# 要同步的知识库 namespace，格式为 <group>/<book>
+yuque_repositories:
+  - qc19gt/fqpid3
+  - qc19gt/ogaye8
+  - qc19gt/oyhmm4
+
+# OpenAI-compatible Embedding（可选；留空则只用本地关键词/grep 检索）
+embedding_api_key: ""
+embedding_base_url: ""
+embedding_model: "text-embedding-3-small"
+
+# 是否启用向量检索。设为 false 可完全跳过联网 embedding，加快响应。
+enable_vector_search: true
+
+# 唤醒词（私聊/群聊 @ 时触发）
+wake_words:
+  - 南大助手
+  - 南小答
+  - nju
+
+# 触发开关
+enable_private_chat: true
+enable_group_at: true
+
+# 检索参数
+retrieval_top_k: 5
+score_threshold: 0.25
+
+# Chunk 切分参数
+chunk_size: 1200
+chunk_overlap: 180
