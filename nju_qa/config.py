@@ -29,6 +29,7 @@ class PluginConfig:
     render_tables_as_images: bool = True
     table_font_path: str = ""
     auto_download_table_font: bool = True
+    table_font_download_timeout: int = 30
 
     @classmethod
     def from_mapping(cls, raw: Any) -> "PluginConfig":
@@ -66,6 +67,7 @@ class PluginConfig:
         render_tables = bool(raw.get("render_tables_as_images", True))
         table_font_path = str(raw.get("table_font_path", ""))
         auto_download_table_font = bool(raw.get("auto_download_table_font", True))
+        table_font_download_timeout = int(raw.get("table_font_download_timeout", 30))
         if not 1 <= top_k <= 20 or not 0 <= threshold <= 1:
             raise ValueError("检索配置超出允许范围")
         if not 200 <= chunk_size <= 8000 or not 0 <= chunk_overlap < chunk_size // 2:
@@ -74,6 +76,8 @@ class PluginConfig:
             raise ValueError("rate_limit 必须在 0 到 1000 之间")
         if not 60 <= group_rate_limit_window <= 86400 or not 60 <= private_rate_limit_window <= 86400:
             raise ValueError("rate_limit_window 必须在 60 到 86400 秒之间")
+        if not 5 <= table_font_download_timeout <= 300:
+            raise ValueError("table_font_download_timeout 必须在 5 到 300 秒之间")
         return cls(
             str(raw.get("yuque_token", "")),
             base,
@@ -96,4 +100,5 @@ class PluginConfig:
             render_tables,
             table_font_path,
             auto_download_table_font,
+            table_font_download_timeout,
         )

@@ -147,6 +147,7 @@ class NjuQaPlugin(Star):
             self._data_dir,
             self.config.table_font_path or None,
             self.config.auto_download_table_font,
+            download_timeout=self.config.table_font_download_timeout,
         )
 
     async def _sync(self) -> str:

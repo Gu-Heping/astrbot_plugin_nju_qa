@@ -19,5 +19,6 @@
   "private_rate_limit_window": {"description": "私聊限流窗口（秒）", "type": "int", "default": 3600},
   "render_tables_as_images": {"description": "将 Markdown 表格渲染为图片插入回复", "type": "bool", "default": true},
   "table_font_path": {"description": "表格图片使用的字体文件绝对路径（留空则自动搜索系统字体或下载）", "type": "string", "default": ""},
-  "auto_download_table_font": {"description": "未找到系统字体时自动下载开源中文字体（Noto Sans CJK SC，约 8 MB）", "type": "bool", "default": true}
+  "auto_download_table_font": {"description": "未找到系统字体时自动下载开源中文字体（Noto Sans CJK SC，约 8 MB）", "type": "bool", "default": true},
+  "table_font_download_timeout": {"description": "字体下载超时（秒），默认 30，范围 5-300", "type": "int", "default": 30}
 }

@@ -166,7 +166,19 @@ def test_config_parses_font_fields():
             "yuque_repositories": ["nju/guide"],
             "table_font_path": "/tmp/font.ttf",
             "auto_download_table_font": False,
+            "table_font_download_timeout": 60,
         }
     )
     assert config.table_font_path == "/tmp/font.ttf"
     assert config.auto_download_table_font is False
+    assert config.table_font_download_timeout == 60
+
+
+def test_config_validates_font_timeout_range():
+    from nju_qa.config import PluginConfig
+    import pytest
+
+    with pytest.raises(ValueError):
+        PluginConfig.from_mapping({"table_font_download_timeout": 3})
+    with pytest.raises(ValueError):
+        PluginConfig.from_mapping({"table_font_download_timeout": 400})

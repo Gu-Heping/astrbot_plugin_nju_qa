@@ -13,10 +13,12 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 # Noto Sans CJK Simplified Chinese Regular is licensed under the SIL Open Font
-# License 1.1. These URLs are tried in order until one succeeds.
+# License 1.1. jsDelivr is tried first because it is usually faster in mainland
+# China; GitHub/Gitee fallbacks are used if it fails.
 _CJK_FONT_URLS = [
-    "https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf",
+    "https://cdn.jsdelivr.net/gh/notofonts/noto-cjk@main/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf",
     "https://gitee.com/mirrors/noto-cjk/raw/main/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf",
+    "https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf",
 ]
 _FONT_FILE_NAME = "NotoSansCJKsc-Regular.otf"
 _FONT_LOCK = asyncio.Lock()
@@ -143,7 +145,7 @@ def _has_cjk(text: str) -> bool:
     )
 
 
-async def _download_font(url: str, dest: Path, timeout: float = 120.0) -> bool:
+async def _download_font(url: str, dest: Path, timeout: float = 30.0) -> bool:
     """Download a font file to ``dest`` and return True if it is valid."""
     try:
         import httpx
@@ -173,6 +175,7 @@ async def ensure_cjk_font(
     data_dir: Path,
     configured_font_path: str | None = None,
     allow_download: bool = True,
+    download_timeout: float = 30.0,
 ) -> str | None:
     """Return a usable CJK font path, downloading one if necessary and allowed.
 
@@ -206,7 +209,7 @@ async def ensure_cjk_font(
             return str(dest)
         for url in _CJK_FONT_URLS:
             logger.info("Downloading CJK font from %s ...", url)
-            if await _download_font(url, dest):
+            if await _download_font(url, dest, timeout=download_timeout):
                 logger.info("CJK font saved to %s", dest)
                 return str(dest)
 

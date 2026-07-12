@@ -15,6 +15,8 @@
 - `grep_local_docs` 改为逐行扫描本地 Markdown，返回匹配行号与上下文片段；`read_doc` 新增 `start_line`/`end_line` 参数，可按行号精确读取。
 - 新增 `table_font_path` 配置：可显式指定表格图片使用的中文字体文件。
 - 新增 `auto_download_table_font` 配置：未找到可用系统字体时，自动下载开源 Noto Sans CJK SC 字体到插件数据目录，避免表格图片出现乱码；下载失败时仍自动回退为纯文本表格。
+- 新增 `table_font_download_timeout` 配置：控制字体自动下载超时，默认 30 秒。
+- 字体下载优先使用 jsDelivr 镜像，失败后再尝试 Gitee/GitHub，减少大陆网络环境下的下载卡顿。
 - 新增按聊天上下文限流：`group_rate_limit` / `private_rate_limit` 及对应窗口配置，限制 `/nju`、`/nju_grep` 和普通消息触发的回答频率；群聊达到上限后首次鼓励私聊提问，私聊达到上限后首次提示稍后再试，之后同一窗口内不再重复回复。管理员命令不受限流影响。
 
 ### Changed
