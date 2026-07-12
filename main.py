@@ -37,7 +37,7 @@ from .nju_qa.vector_index import ChunkVectorIndex
 
 def _plain(event: AstrMessageEvent, text: str):
     """Send text stripped of Markdown markup for QQ plain-text chat."""
-    return _plain(event,markdown_to_plaintext(text))
+    return event.plain_result(markdown_to_plaintext(text))
 
 
 @register("astrbot_plugin_nju_qa", "peace", "南京大学知识库问答助手", "0.1.0")

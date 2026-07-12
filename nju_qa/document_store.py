@@ -34,16 +34,19 @@ class DocumentStore:
         base.mkdir(parents=True, exist_ok=True)
         stem = self.safe_name(title)
         candidate = base / f"{stem}.md"
+        # Used set contains root-relative paths; compare in the same space.
+        rel = candidate.resolve().relative_to(self.root.resolve())
         suffix = 2
         while (
-            candidate in used
+            rel in used
             or candidate.exists()
             and not self._has_id(candidate, doc_id)
         ):
             candidate = base / f"{stem}_{suffix}.md"
+            rel = candidate.resolve().relative_to(self.root.resolve())
             suffix += 1
         # Persist relative paths so the SQLite records stay valid regardless of cwd.
-        return candidate.resolve().relative_to(self.root.resolve())
+        return rel
 
     def _has_id(self, path: Path, doc_id: str) -> bool:
         try:

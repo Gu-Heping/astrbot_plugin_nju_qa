@@ -45,7 +45,7 @@ def test_safe_paths_markdown_and_duplicates(tmp_path):
     two = store.path_for("nju/guide", ["../bad"], "a/b", "2", used)
     assert (
         one != two
-        and tmp_path.resolve() in one.resolve().parents
+        and tmp_path.resolve() in store._to_target(one).resolve().parents
         and ".." not in str(one)
     )
     store.write(doc(one))
