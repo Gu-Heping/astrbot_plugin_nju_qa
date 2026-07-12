@@ -10,6 +10,7 @@
 - `/nju_debug`：管理员命令，用于查看 AstrBot 对 `/nju` 命令的解析结果。
 - 后台任务启动反馈：`/nju_sync`、`/nju_index rebuild` 立即返回“已启动后台...”提示，避免用户误以为无响应。
 - Agent 关键步骤日志：provider、检索源数量、可靠源数量、grounding 源数量、引用数量。
+- 输出 Markdown 转纯文本：所有命令和普通消息回复在发送前都会去掉 Markdown 标记（标题、加粗、代码块、图片、链接等），适配 QQ 个人号聊天页的纯文本显示。
 
 ### Changed
 

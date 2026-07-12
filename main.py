@@ -16,6 +16,7 @@ from .nju_qa.chunk_store import ChunkStore
 from .nju_qa.config import PluginConfig
 from .nju_qa.document_index import DocumentIndex
 from .nju_qa.document_store import DocumentStore
+from .nju_qa.formatting import markdown_to_plaintext
 from .nju_qa.retriever import HybridRetriever
 from .nju_qa.routing import MessageRouter, mark_command_handled
 from .nju_qa.sync_service import SyncService
@@ -32,6 +33,11 @@ from .nju_qa.tools import (
 )
 from .nju_qa.yuque_client import YuqueClient
 from .nju_qa.vector_index import ChunkVectorIndex
+
+
+def _plain(event: AstrMessageEvent, text: str):
+    """Send text stripped of Markdown markup for QQ plain-text chat."""
+    return _plain(event,markdown_to_plaintext(text))
 
 
 @register("astrbot_plugin_nju_qa", "peace", "南京大学知识库问答助手", "0.1.0")
@@ -127,15 +133,15 @@ class NjuQaPlugin(Star):
         if source_match:
             keyword = source_match.group(1).strip()
             if not keyword:
-                yield event.plain_result("用法：/nju source <关键词>")
+                yield _plain(event,"用法：/nju source <关键词>")
                 return
-            yield event.plain_result(
+            yield _plain(event,
                 self._format_sources(await self.retriever.search(keyword))
             )
             return
 
         if re.match(r"^nju(\s+help)?$", text, re.IGNORECASE):
-            yield event.plain_result(
+            yield _plain(event,
                 "/nju <问题>：查询知识库\n"
                 "/nju source <关键词>：查看来源\n"
                 "/nju_grep <关键词>：全文搜索本地文档\n"
@@ -151,10 +157,10 @@ class NjuQaPlugin(Star):
             answer = await self.agent.answer(event, query)
         except Exception as exc:
             logger.exception("NJU QA agent failed")
-            yield event.plain_result(f"检索失败：{exc}")
+            yield _plain(event,f"检索失败：{exc}")
             return
         logger.info("NJU command answer length=%d first_100=%r", len(answer), answer[:100])
-        yield event.plain_result(answer)
+        yield _plain(event,answer)
 
     @filter.command("nju_debug")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -164,7 +170,7 @@ class NjuQaPlugin(Star):
         text = (getattr(event, "message_str", None) or "").strip()
         source_re = r"^nju\s+source\s+"
         matched = bool(re.match(source_re, text, re.IGNORECASE))
-        yield event.plain_result(
+        yield _plain(event,
             f"message_str: {repr(text)}\n"
             f"handler_arg: {repr(question)}\n"
             f"matched_source: {matched}"
@@ -174,7 +180,7 @@ class NjuQaPlugin(Star):
     async def nju_grep(self, event: AstrMessageEvent, keywords: str = ""):
         mark_command_handled(event)
         if not keywords.strip():
-            yield event.plain_result("用法：/nju_grep <空格分隔的关键词>")
+            yield _plain(event,"用法：/nju_grep <空格分隔的关键词>")
             return
         tool = GrepLocalDocsTool(index=self.index, docs_root=self.store.root)
         result = await tool._run(keywords)
@@ -188,7 +194,7 @@ class NjuQaPlugin(Star):
                 )
                 result = await tool._run(split_terms)
         if not result.get("results"):
-            yield event.plain_result("本地文档中未找到匹配内容。")
+            yield _plain(event,"本地文档中未找到匹配内容。")
             return
         lines = [f"共找到 {result['count']} 条："]
         for i, hit in enumerate(result["results"][:10], 1):
@@ -197,37 +203,37 @@ class NjuQaPlugin(Star):
             lines.append(
                 f"{i}. 《{hit.get('title')}》：{source_url}\n   {snippet}..."
             )
-        yield event.plain_result("\n".join(lines))
+        yield _plain(event,"\n".join(lines))
 
     @filter.command("nju_sync")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def nju_sync(self, event: AstrMessageEvent, action: str = ""):
         mark_command_handled(event)
         if action.lower() == "status":
-            yield event.plain_result(self.syncer.status_text())
+            yield _plain(event,self.syncer.status_text())
             return
         if self._sync_task and not self._sync_task.done():
-            yield event.plain_result(
+            yield _plain(event,
                 "同步正在进行中；请使用 /nju_sync status 查看状态。"
             )
             return
         self._sync_task = asyncio.create_task(self._sync())
-        yield event.plain_result("已启动后台同步；请使用 /nju_sync status 查看状态。")
+        yield _plain(event,"已启动后台同步；请使用 /nju_sync status 查看状态。")
 
     @filter.command("nju_index")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def nju_index(self, event: AstrMessageEvent, action: str = ""):
         mark_command_handled(event)
         if action.lower() != "rebuild":
-            yield event.plain_result("用法：/nju_index rebuild")
+            yield _plain(event,"用法：/nju_index rebuild")
             return
         if self._rebuild_task is not None and not self._rebuild_task.done():
-            yield event.plain_result(
+            yield _plain(event,
                 "索引重建正在进行中；请使用 /nju_sync status 查看状态。"
             )
             return
         self._rebuild_task = asyncio.create_task(self._rebuild())
-        yield event.plain_result(
+        yield _plain(event,
             "已启动后台索引重建；请使用 /nju_sync status 查看进度和结果。"
         )
 
@@ -236,9 +242,9 @@ class NjuQaPlugin(Star):
     async def nju_search(self, event: AstrMessageEvent, query: str = ""):
         mark_command_handled(event)
         if not query.strip():
-            yield event.plain_result("用法：/nju_search <查询词>")
+            yield _plain(event,"用法：/nju_search <查询词>")
             return
-        yield event.plain_result(
+        yield _plain(event,
             self.retriever.debug_text(await self.retriever.debug_search(query))
         )
 
@@ -258,10 +264,10 @@ class NjuQaPlugin(Star):
             return
         mark_command_handled(event)
         try:
-            yield event.plain_result(await self.agent.answer(event, routed.query))
+            yield _plain(event,await self.agent.answer(event, routed.query))
         except Exception:
             logger.exception("NJU QA message handling failed")
-            yield event.plain_result("处理问题时出错，请稍后重试。")
+            yield _plain(event,"处理问题时出错，请稍后重试。")
 
     @staticmethod
     def _raw_message_text(event: AstrMessageEvent) -> str:
