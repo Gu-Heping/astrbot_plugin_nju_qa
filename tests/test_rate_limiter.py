@@ -139,7 +139,7 @@ def plugin_class():
     This is necessary because main.py uses package-relative imports and is not
     inside a regular Python package at the repository root.
     """
-    pytest.importorskip("astrbot")
+    pytest.importorskip("astrbot.core.agent.run_context")
     root = Path(__file__).parent.parent
     parent = str(root.parent)
     if parent not in sys.path:

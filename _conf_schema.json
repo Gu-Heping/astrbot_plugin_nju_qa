@@ -17,5 +17,6 @@
   "group_rate_limit_window": {"description": "群聊限流窗口（秒）", "type": "int", "default": 3600},
   "private_rate_limit": {"description": "私聊每小时最多响应次数，0 表示不限", "type": "int", "default": 20},
   "private_rate_limit_window": {"description": "私聊限流窗口（秒）", "type": "int", "default": 3600},
-  "render_tables_as_images": {"description": "将 Markdown 表格渲染为图片插入回复", "type": "bool", "default": true}
+  "render_tables_as_images": {"description": "将 Markdown 表格渲染为图片插入回复", "type": "bool", "default": true},
+  "table_font_path": {"description": "表格图片使用的字体文件绝对路径（留空则自动搜索系统字体）", "type": "string", "default": ""}
 }

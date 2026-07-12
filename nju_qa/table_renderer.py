@@ -8,33 +8,88 @@ from pathlib import Path
 from typing import Any
 
 
-def _find_font(size: int):
-    """Return a Pillow ImageFont using a system CJK font if available."""
+def _find_font(size: int, font_path: str | None = None):
+    """Return a Pillow ImageFont using a system CJK font if available.
+
+    Returns ``None`` when no usable CJK font is found, so callers can fall
+    back to plain text instead of producing tofu.
+    """
     try:
         from PIL import ImageFont
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError("Pillow is required for table rendering") from exc
 
+    if font_path:
+        try:
+            return ImageFont.truetype(font_path, size)
+        except Exception:
+            pass
+
     candidates = [
-        # Windows
+        # Windows common Chinese fonts
         "C:/Windows/Fonts/msyh.ttc",
         "C:/Windows/Fonts/msyhbd.ttc",
         "C:/Windows/Fonts/simhei.ttf",
         "C:/Windows/Fonts/simsun.ttc",
-        # Linux
+        "C:/Windows/Fonts/nsimsun.ttc",
+        "C:/Windows/Fonts/msgothic.ttc",
+        "C:/Windows/Fonts/YuGothM.ttc",
+        # Linux: Noto CJK
         "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-VF.ttf.ttc",
+        # Linux: WenQuanYi
         "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        # Linux: Arphic
+        "/usr/share/fonts/truetype/arphic/uming.ttc",
+        "/usr/share/fonts/truetype/arphic/ukai.ttc",
+        "/usr/share/fonts/opentype/arphic/uming.ttc",
+        # Linux: Droid
+        "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
         # macOS
         "/System/Library/Fonts/PingFang.ttc",
         "/System/Library/Fonts/STHeiti Light.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+        "/Library/Fonts/Arial Unicode.ttf",
     ]
     for path in candidates:
         try:
             return ImageFont.truetype(path, size)
         except Exception:
             continue
-    return ImageFont.load_default()
+
+    # Optional: let Matplotlib scan the system font list for CJK fonts.
+    try:
+        from matplotlib import font_manager as fm
+
+        cjk_keywords = ("cjk", "hei", "song", "ming", "noto", "wqy", "source han",
+                        "han sans", "microsoft yahei", "pingfang", "heiti", "黑体",
+                        "宋体", "明体", "思源")
+        for path in fm.findSystemFonts():
+            try:
+                prop = fm.FontProperties(fname=path)
+                name = (prop.get_name() or "").lower()
+                if any(k in name for k in cjk_keywords):
+                    return ImageFont.truetype(path, size)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return None
+
+
+def _has_cjk(text: str) -> bool:
+    """Return True if text contains CJK characters."""
+    return any(
+        "一" <= char <= "鿿"
+        or "　" <= char <= "〿"
+        or "＀" <= char <= "￯"
+        for char in text
+    )
 
 
 def _is_table_row(line: str) -> bool:
@@ -119,6 +174,7 @@ def _wrap_text(text: str, font: Any, max_width: int) -> list[str]:
 def _render_table_image(
     rows: list[list[str]],
     output_path: Path,
+    font_path: str | None = None,
     font_size: int = 20,
     max_col_width: int = 360,
     padding: int = 10,
@@ -127,9 +183,17 @@ def _render_table_image(
     border_color: str = "#333333",
 ) -> Path:
     """Draw rows as a PNG table and save to output_path."""
-    from PIL import Image, ImageDraw
+    from PIL import Image, ImageDraw, ImageFont
 
-    font = _find_font(font_size)
+    all_text = "".join("".join(row) for row in rows)
+    font = _find_font(font_size, font_path=font_path)
+    if font is None and _has_cjk(all_text):
+        raise RuntimeError(
+            "No CJK font found for rendering table; install a Chinese font or set table_font_path"
+        )
+    if font is None:
+        font = ImageFont.load_default()
+
     # Calculate natural column widths (header + body).
     col_count = len(rows[0]) if rows else 0
     col_widths = [0] * col_count
@@ -189,12 +253,16 @@ def _render_table_image(
 def render_tables_as_images(
     markdown_text: str,
     image_dir: Path,
+    font_path: str | None = None,
 ) -> list[tuple[str, str]]:
     """Split markdown text into text/image segments.
 
     Returns a list of ("text", plain_text) and ("image", image_path) tuples.
     Text segments are plain Markdown with tables removed; image segments contain
     paths to rendered PNGs of the tables.
+
+    If no CJK font is available, tables are kept as plain text instead of
+    producing garbled images.
     """
     from .formatting import markdown_to_plaintext
 
@@ -204,15 +272,19 @@ def render_tables_as_images(
 
     segments: list[tuple[str, str]] = []
     last_end = 0
-    for start, end, rows in blocks:
-        before_lines = markdown_text.splitlines()[last_end:start]
-        before_text = "\n".join(before_lines)
-        if before_text.strip():
-            segments.append(("text", markdown_to_plaintext(before_text)))
-        image_path = image_dir / f"table_{uuid.uuid4().hex}.png"
-        _render_table_image(rows, image_path)
-        segments.append(("image", str(image_path)))
-        last_end = end
+    try:
+        for start, end, rows in blocks:
+            before_lines = markdown_text.splitlines()[last_end:start]
+            before_text = "\n".join(before_lines)
+            if before_text.strip():
+                segments.append(("text", markdown_to_plaintext(before_text)))
+            image_path = image_dir / f"table_{uuid.uuid4().hex}.png"
+            _render_table_image(rows, image_path, font_path=font_path)
+            segments.append(("image", str(image_path)))
+            last_end = end
+    except RuntimeError:
+        # No usable font: fall back to the original plain-text rendering.
+        return [("text", markdown_to_plaintext(markdown_text))]
 
     after_lines = markdown_text.splitlines()[last_end:]
     after_text = "\n".join(after_lines)

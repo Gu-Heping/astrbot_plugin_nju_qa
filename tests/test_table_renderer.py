@@ -13,6 +13,17 @@ from nju_qa.table_renderer import (
 )
 
 
+def test_render_tables_fallback_to_plain_text_when_no_font(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "nju_qa.table_renderer._find_font", lambda size, font_path=None: None
+    )
+    text = "| 配置 | 说明 |\n| --- | --- |\n| A | B |\n"
+    segments = render_tables_as_images(text, tmp_path)
+    assert len(segments) == 1
+    assert segments[0][0] == "text"
+    assert "配置" in segments[0][1]
+
+
 def test_parse_simple_table():
     text = (
         "| 配置 | 必填 | 说明 |\n"

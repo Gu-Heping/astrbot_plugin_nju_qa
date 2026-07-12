@@ -27,6 +27,7 @@ class PluginConfig:
     private_rate_limit: int = 20
     private_rate_limit_window: int = 3600
     render_tables_as_images: bool = True
+    table_font_path: str = ""
 
     @classmethod
     def from_mapping(cls, raw: Any) -> "PluginConfig":
@@ -62,6 +63,7 @@ class PluginConfig:
         private_rate_limit = int(raw.get("private_rate_limit", 20))
         private_rate_limit_window = int(raw.get("private_rate_limit_window", 3600))
         render_tables = bool(raw.get("render_tables_as_images", True))
+        table_font_path = str(raw.get("table_font_path", ""))
         if not 1 <= top_k <= 20 or not 0 <= threshold <= 1:
             raise ValueError("检索配置超出允许范围")
         if not 200 <= chunk_size <= 8000 or not 0 <= chunk_overlap < chunk_size // 2:
@@ -90,4 +92,5 @@ class PluginConfig:
             private_rate_limit,
             private_rate_limit_window,
             render_tables,
+            table_font_path,
         )

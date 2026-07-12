@@ -362,7 +362,8 @@ class NjuQaPlugin(Star):
         """Return plain text or a text+image chain if the answer contains tables."""
         if not self.config.render_tables_as_images:
             return _plain(event, text)
-        segments = render_tables_as_images(text, self._table_image_dir)
+        font_path = self.config.table_font_path or None
+        segments = render_tables_as_images(text, self._table_image_dir, font_path=font_path)
         return _build_rich_result(event, segments)
 
     @staticmethod
