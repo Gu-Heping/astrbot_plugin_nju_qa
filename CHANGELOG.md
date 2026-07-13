@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-13
+
 ### Added
 
 - `/nju_grep`：全文搜索本地 Markdown，长中文查询未命中时自动按二字切分兜底。
@@ -18,6 +20,8 @@
 - 新增 `table_font_download_timeout` 配置：控制字体自动下载超时，默认 30 秒。
 - 字体下载优先使用 jsDelivr 镜像，失败后再尝试 Gitee/GitHub，减少大陆网络环境下的下载卡顿。
 - 新增按聊天上下文限流：`group_rate_limit` / `private_rate_limit` 及对应窗口配置，限制 `/nju`、`/nju_grep` 和普通消息触发的回答频率；群聊达到上限后首次鼓励私聊提问，私聊达到上限后首次提示稍后再试，之后同一窗口内不再重复回复。管理员命令不受限流影响。
+- 新增 `render_tables_as_images` 配置：将回答中的 Markdown 表格渲染为 PNG 图片插入回复，默认开启。
+- 新增路由安全回归测试，覆盖未知 slash 抑制、跨插件命令放行、自身命令匹配、@/唤醒词/私聊入口等场景。
 
 ### Changed
 
@@ -30,6 +34,7 @@
 
 ### Fixed
 
+- 修复未知 `/...` 指令会回退到 AstrBot 默认 LLM 的问题：`on_message` 现在通过 `handlers_parsed_params` 和 `activated_handlers` 检测是否已匹配注册命令；对未匹配的 `/...` 调用 `event.should_call_llm(True)` 阻止默认 LLM，同时不 `stop_event`，保证其他插件的 ALL-message handler 仍能处理。
 - 修复部分 AstrBot 实例只发出命令 handler 第一个 `yield` 导致最终答案丢失的问题；`/nju`、`/nju_grep`、`/nju_search` 等改为单次 yield 返回。
 - 修复 `read_doc` / `get_doc_details` 因数据库中 `path` 列已包含 `docs_root` 前缀而报 `invalid document path` 的问题，并统一 `DocumentStore` 后续写入使用相对 `docs_root` 的路径。
 - 修复 `grep_local_docs` 对长中文关键词无法命中时的兜底检索逻辑。

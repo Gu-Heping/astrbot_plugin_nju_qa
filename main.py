@@ -60,7 +60,7 @@ def _build_rich_result(event: AstrMessageEvent, segments: list[tuple[str, str]])
     return event.chain_result(chain)
 
 
-@register("astrbot_plugin_nju_qa", "peace", "南京大学知识库问答助手", "0.1.0")
+@register("astrbot_plugin_nju_qa", "peace", "南京大学知识库问答助手", "0.2.0")
 class NjuQaPlugin(Star):
     """Explicitly triggered NJU knowledge-base Q&A plugin."""
 
@@ -305,8 +305,6 @@ class NjuQaPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
-        self._log_routing_diagnostics(event)
-
         # If a command handler (ours or another plugin) has already stopped the
         # event, do nothing further.
         if self._is_event_stopped(event):
@@ -320,7 +318,6 @@ class NjuQaPlugin(Star):
         # must not be stopped so that other plugins' ALL-message handlers can
         # still process them.
         if self._is_unknown_slash_message(event, original):
-            logger.warning("[NJU QA routing diag] suppressing default LLM for unknown slash message")
             self._suppress_default_llm(event)
             return
         is_at_me = self._is_at_me(event)
@@ -453,49 +450,6 @@ class NjuQaPlugin(Star):
             if at_types and isinstance(first, at_types):
                 return False
         return True
-
-    def _log_routing_diagnostics(self, event: AstrMessageEvent) -> None:
-        """Temporary routing diagnostics; no tokens or secrets are logged."""
-        try:
-            raw_text = self._raw_message_text(event)
-            messages = self._get_message_chain(event)
-            from astrbot.api import message_components as comp
-
-            component_info = []
-            for part in messages:
-                typename = type(part).__name__
-                text = getattr(part, "text", None)
-                if isinstance(part, comp.Plain) and text is not None:
-                    component_info.append(f"{typename}(text={text!r})")
-                elif isinstance(part, comp.At):
-                    component_info.append(f"{typename}(qq=...)")
-                else:
-                    component_info.append(typename)
-
-            activated = event.get_extra("activated_handlers") or []
-            handler_names = [
-                getattr(h, "handler_full_name", repr(h)) for h in activated
-            ]
-            parsed = event.get_extra("handlers_parsed_params") or {}
-
-            logger.warning(
-                "[NJU QA routing diag] message_str=%r raw_text=%r "
-                "is_command=%r is_stopped=%r is_wake=%r "
-                "is_at_or_wake_command=%r call_llm=%r "
-                "activated_handlers=%r handlers_parsed_params=%r components=%r",
-                getattr(event, "message_str", None),
-                raw_text,
-                getattr(event, "is_command", None),
-                self._is_event_stopped(event),
-                getattr(event, "is_wake", None),
-                getattr(event, "is_at_or_wake_command", None),
-                getattr(event, "call_llm", None),
-                handler_names,
-                list(parsed.keys()),
-                component_info,
-            )
-        except Exception:
-            logger.exception("NJU QA routing diagnostic failed")
 
     @staticmethod
     def _suppress_default_llm(event: AstrMessageEvent) -> None:
