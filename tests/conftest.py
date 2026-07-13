@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import sys
 import types
 from collections.abc import Callable
+from pathlib import Path
+
+import pytest
 
 
 def _make_module(name: str) -> types.ModuleType:
@@ -111,6 +115,8 @@ def _install_astrbot_shim() -> None:
     event_mod.filter = _Filter()
     event_mod.PermissionType = PermissionType
     event_mod.EventMessageType = EventMessageType
+    _Filter.PermissionType = PermissionType
+    _Filter.EventMessageType = EventMessageType
     api.event = event_mod
 
     class AstrMessageEvent:
@@ -120,5 +126,73 @@ def _install_astrbot_shim() -> None:
 
     event_mod.AstrMessageEvent = AstrMessageEvent
 
+    # core.agent.run_context stub used by nju_qa.tools.
+    core = _make_module("astrbot.core")
+    astrbot_pkg.core = core
+    agent = _make_module("astrbot.core.agent")
+    core.agent = agent
+    run_context = _make_module("astrbot.core.agent.run_context")
+    agent.run_context = run_context
+
+    class ContextWrapper:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+    run_context.ContextWrapper = ContextWrapper
+
+    # core.astr_agent_context stub used by nju_qa.tools.
+    astr_agent_context = _make_module("astrbot.core.astr_agent_context")
+    core.astr_agent_context = astr_agent_context
+
+    class AstrAgentContext:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+    astr_agent_context.AstrAgentContext = AstrAgentContext
+
 
 _install_astrbot_shim()
+
+# ---------------------------------------------------------------------------
+# Load the plugin entry point once before test modules import submodules.
+#
+# main.py uses package-relative imports.  Loading it here populates nju_qa's
+# attributes and lets us alias the submodule objects under their plain
+# ``nju_qa.*`` names, so monkeypatch-based tests operate on the same module
+# objects the plugin code uses.
+# ---------------------------------------------------------------------------
+
+ROOT = Path(__file__).parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+if str(ROOT.parent) not in sys.path:
+    sys.path.insert(0, str(ROOT.parent))
+
+import nju_qa  # noqa: E402
+
+_pkg = types.ModuleType("astrbot_plugin_nju_qa")
+_pkg.__path__ = [str(ROOT)]
+sys.modules["astrbot_plugin_nju_qa"] = _pkg
+sys.modules["astrbot_plugin_nju_qa.nju_qa"] = nju_qa
+
+_main_spec = importlib.util.spec_from_file_location(
+    "astrbot_plugin_nju_qa.main", ROOT / "main.py"
+)
+_main_mod = importlib.util.module_from_spec(_main_spec)
+sys.modules["astrbot_plugin_nju_qa.main"] = _main_mod
+_main_spec.loader.exec_module(_main_mod)
+
+for _attr_name, _attr in list(nju_qa.__dict__.items()):
+    if isinstance(_attr, types.ModuleType) and not _attr_name.startswith("_"):
+        sys.modules.setdefault(f"nju_qa.{_attr_name}", _attr)
+
+
+# ---------------------------------------------------------------------------
+# Shared fixtures for integration tests that need to load main.py.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def plugin_class():
+    """Return the plugin class loaded at conftest import time."""
+    return sys.modules["astrbot_plugin_nju_qa.main"].NjuQaPlugin

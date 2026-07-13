@@ -168,44 +168,35 @@ class NjuQaPlugin(Star):
         if not re.match(r"^nju(\s+.*)?$", text, re.IGNORECASE):
             return
         mark_command_handled(event)
-        rl_state = self._check_rate_limit(event)
-        if rl_state:
-            if not rl_state.silent:
-                yield self._rich_result(event, self._rate_limit_message(rl_state))
-            return
 
         source_match = re.match(r"^nju\s+source\s+(.+)$", text, re.IGNORECASE)
         if source_match:
             keyword = source_match.group(1).strip()
             if not keyword:
-                yield self._rich_result(event,"用法：/nju source <关键词>")
+                yield self._rich_result(event, "用法：/nju source <关键词>")
                 return
-            yield self._rich_result(event,
-                self._format_sources(await self.retriever.search(keyword))
+            yield self._rich_result(
+                event, self._format_sources(await self.retriever.search(keyword))
             )
             return
 
         if re.match(r"^nju(\s+help)?$", text, re.IGNORECASE):
-            yield self._rich_result(event,
+            yield self._rich_result(
+                event,
                 "/nju <问题>：查询知识库\n"
                 "/nju source <关键词>：查看来源\n"
                 "/nju_grep <关键词>：全文搜索本地文档\n"
                 "/nju_sync / /nju_index / /nju_search：管理员命令\n"
-                "本项目为非官方开源项目，与南京大学官方无隶属或授权关系。"
+                "本项目为非官方开源项目，与南京大学官方无隶属或授权关系。",
             )
             return
 
-        # Regular question: strip the nju prefix.
+        # Regular question: rate limiting and answering live in _answer_question
+        # so /nju, @-mentions, wake words and private chat all share one path.
         query = re.sub(r"^nju\s*", "", text, flags=re.IGNORECASE).strip()
         logger.info("NJU command parsed query: %r", query)
-        try:
-            answer = await self.agent.answer(event, query)
-        except Exception as exc:
-            logger.exception("NJU QA agent failed")
-            yield self._rich_result(event,f"检索失败：{exc}")
-            return
-        logger.info("NJU command answer length=%d first_100=%r", len(answer), answer[:100])
-        yield self._rich_result(event,answer)
+        async for result in self._answer_question(event, query):
+            yield result
 
     @filter.command("nju_debug")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -314,15 +305,23 @@ class NjuQaPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
-        # Ignore messages that AstrBot has already identified as commands.
-        if getattr(event, "is_command", False):
+        self._log_routing_diagnostics(event)
+
+        # If a command handler (ours or another plugin) has already stopped the
+        # event, do nothing further.
+        if self._is_event_stopped(event):
+            return
+        # If AstrBot matched a registered command (ours or another plugin), let
+        # that handler run.  We must not reply or stop the event here.
+        if self._has_matched_registered_command(event):
             return
         original = self._raw_message_text(event)
-        # AstrBot strips the leading '/' from event.message_str before command
-        # handlers run, so ALL-message listeners see "audit ok" instead of
-        # "/audit ok". Ignore raw command-like messages to avoid conflicting
-        # with other plugins (e.g. astrbot_plugin_nju_qq_audit).
-        if original.lstrip().startswith("/"):
+        # Unknown slash messages should not wake the default LLM, but they also
+        # must not be stopped so that other plugins' ALL-message handlers can
+        # still process them.
+        if self._is_unknown_slash_message(event, original):
+            logger.warning("[NJU QA routing diag] suppressing default LLM for unknown slash message")
+            self._suppress_default_llm(event)
             return
         is_at_me = self._is_at_me(event)
         text = self._remove_at(event, original) if is_at_me else original
@@ -330,26 +329,18 @@ class NjuQaPlugin(Star):
         if not routed.should_handle or not routed.query:
             return
         mark_command_handled(event)
-        rl_state = self._check_rate_limit(event)
-        if rl_state:
-            if not rl_state.silent:
-                yield self._rich_result(event, self._rate_limit_message(rl_state))
-            return
-        try:
-            yield self._rich_result(event,await self.agent.answer(event, routed.query))
-        except Exception:
-            logger.exception("NJU QA message handling failed")
-            yield self._rich_result(event,"处理问题时出错，请稍后重试。")
+        async for result in self._answer_question(event, routed.query):
+            yield result
 
     @staticmethod
     def _raw_message_text(event: AstrMessageEvent) -> str:
-        """Return the original plain text before AstrBot strips the command '/'."""
+        """Return the original plain text before AstrBot strips the command prefix."""
         try:
             from astrbot.api import message_components as comp
 
             return "".join(
                 part.text
-                for part in event.message_obj.message
+                for part in NjuQaPlugin._get_message_chain(event)
                 if isinstance(part, comp.Plain)
             ).strip()
         except (AttributeError, ImportError):
@@ -373,6 +364,174 @@ class NjuQaPlugin(Star):
         font_path = self.config.table_font_path or self._resolved_font_path
         segments = render_tables_as_images(text, self._table_image_dir, font_path=font_path)
         return _build_rich_result(event, segments)
+
+    @staticmethod
+    def _is_event_stopped(event: AstrMessageEvent) -> bool:
+        """Return True if a previous handler has already stopped the event."""
+        getter = getattr(event, "is_stopped", None)
+        if callable(getter):
+            return getter()
+        return bool(getattr(event, "stopped", False))
+
+    @staticmethod
+    def _has_matched_registered_command(event: AstrMessageEvent) -> bool:
+        """Return True if AstrBot has matched a registered command handler.
+
+        This relies on metadata written by WakingCheckStage.  It does not rely
+        on ``event.is_command`` or ``event.is_stopped()``, because those flags
+        may be set for any ``/`` wake-prefix message or may be missing.
+        """
+        # AstrBot may set this flag directly for wake-prefix commands.
+        if event.get_extra("astrbot_known_wake_prefix_command") is True:
+            return True
+
+        parsed = event.get_extra("handlers_parsed_params")
+        if isinstance(parsed, dict) and parsed:
+            # Any non-empty parsed-params dict means at least one command-filter
+            # handler matched (including NJU QA's own /nju).  Let those handlers
+            # run; on_message should not interfere.
+            return True
+
+        activated = event.get_extra("activated_handlers")
+        if isinstance(activated, (list, tuple)):
+            for handler in activated:
+                if not handler:
+                    continue
+                for filter_ in getattr(handler, "event_filters", []) or []:
+                    if type(filter_).__name__ in ("CommandFilter", "CommandGroupFilter"):
+                        return True
+
+        return False
+
+    @staticmethod
+    def _get_message_chain(event: AstrMessageEvent) -> list:
+        """Return the message chain, or an empty list on error."""
+        try:
+            return event.message_obj.message
+        except Exception:
+            return []
+
+    def _wake_prefixes(self) -> list[str]:
+        """Return the configured wake prefixes, defaulting to ["/"]."""
+        ctx = getattr(self, "context", None)
+        cfg = getattr(ctx, "astrbot_config", None) or getattr(ctx, "config", None) or {}
+        prefixes = cfg.get("wake_prefix", ["/"])
+        if isinstance(prefixes, str):
+            prefixes = [prefixes]
+        return list(prefixes) or ["/"]
+
+    def _is_unknown_slash_message(
+        self, event: AstrMessageEvent, original: str
+    ) -> bool:
+        """Return True for an unmatched wake-prefix slash message.
+
+        We must block the default LLM for these messages without stopping the
+        event, so other plugins' ALL-message handlers can still process them.
+        """
+        # Fast path: the original message chain still starts with a wake prefix.
+        prefixes = self._wake_prefixes()
+        if any(original.startswith(p) for p in prefixes):
+            return True
+
+        # Fallback: some adapters strip the prefix from message_obj.  If the
+        # event was woken by a wake prefix in a group (not @, not private) and
+        # no registered command matched, treat it as an unknown slash message.
+        if not getattr(event, "is_at_or_wake_command", False):
+            return False
+        if event.is_private_chat():
+            return False
+        messages = self._get_message_chain(event)
+        if messages:
+            from astrbot.api import message_components as comp
+
+            at_types = tuple(
+                cls
+                for name in ("At", "AtAll", "Reply")
+                if (cls := getattr(comp, name, None)) is not None
+            )
+            first = messages[0]
+            if at_types and isinstance(first, at_types):
+                return False
+        return True
+
+    def _log_routing_diagnostics(self, event: AstrMessageEvent) -> None:
+        """Temporary routing diagnostics; no tokens or secrets are logged."""
+        try:
+            raw_text = self._raw_message_text(event)
+            messages = self._get_message_chain(event)
+            from astrbot.api import message_components as comp
+
+            component_info = []
+            for part in messages:
+                typename = type(part).__name__
+                text = getattr(part, "text", None)
+                if isinstance(part, comp.Plain) and text is not None:
+                    component_info.append(f"{typename}(text={text!r})")
+                elif isinstance(part, comp.At):
+                    component_info.append(f"{typename}(qq=...)")
+                else:
+                    component_info.append(typename)
+
+            activated = event.get_extra("activated_handlers") or []
+            handler_names = [
+                getattr(h, "handler_full_name", repr(h)) for h in activated
+            ]
+            parsed = event.get_extra("handlers_parsed_params") or {}
+
+            logger.warning(
+                "[NJU QA routing diag] message_str=%r raw_text=%r "
+                "is_command=%r is_stopped=%r is_wake=%r "
+                "is_at_or_wake_command=%r call_llm=%r "
+                "activated_handlers=%r handlers_parsed_params=%r components=%r",
+                getattr(event, "message_str", None),
+                raw_text,
+                getattr(event, "is_command", None),
+                self._is_event_stopped(event),
+                getattr(event, "is_wake", None),
+                getattr(event, "is_at_or_wake_command", None),
+                getattr(event, "call_llm", None),
+                handler_names,
+                list(parsed.keys()),
+                component_info,
+            )
+        except Exception:
+            logger.exception("NJU QA routing diagnostic failed")
+
+    @staticmethod
+    def _suppress_default_llm(event: AstrMessageEvent) -> None:
+        """Tell AstrBot not to fall back to the default LLM for this event.
+
+        AstrBot's ProcessStage calls the default LLM when
+        ``not event.call_llm`` is true for an @/wake message.  Therefore
+        ``should_call_llm(True)`` (setting ``call_llm=True``) is the value
+        that actually blocks the fallback.  The naming is inverted relative
+        to the public method name.
+        """
+        setter = getattr(event, "should_call_llm", None)
+        if callable(setter):
+            setter(True)
+        else:
+            # Fallback for older AstrBot builds that expose the attribute
+            # directly: set it so the ProcessStage guard sees a truthy value.
+            try:
+                event.call_llm = True
+            except Exception:
+                pass
+
+    async def _answer_question(self, event: AstrMessageEvent, query: str):
+        """Shared Q&A entry used by /nju, @-mentions, wake words and private chat."""
+        rl_state = self._check_rate_limit(event)
+        if rl_state:
+            if not rl_state.silent:
+                yield self._rich_result(event, self._rate_limit_message(rl_state))
+            return
+        try:
+            answer = await self.agent.answer(event, query)
+        except Exception as exc:
+            logger.exception("NJU QA agent failed")
+            yield self._rich_result(event, f"检索失败：{exc}")
+            return
+        yield self._rich_result(event, answer)
 
     @staticmethod
     def _chat_key(event: AstrMessageEvent) -> tuple[bool, str]:

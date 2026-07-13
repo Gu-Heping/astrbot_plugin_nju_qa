@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import sys
-import types
-from pathlib import Path
 
 import pytest
 
 from nju_qa.config import PluginConfig
 from nju_qa.rate_limiter import RateLimiter
+from tests.helpers import _FakeEvent, _collect, _make_plugin
 
 
 def test_allows_up_to_max_count():
@@ -132,91 +130,6 @@ def test_config_validates_rate_limit_ranges():
         PluginConfig.from_mapping({"private_rate_limit_window": 100000})
 
 
-@pytest.fixture(scope="module")
-def plugin_class():
-    """Dynamically load main.py as part of a temporary package.
-
-    This is necessary because main.py uses package-relative imports and is not
-    inside a regular Python package at the repository root.
-    """
-    pytest.importorskip("astrbot.core.agent.run_context")
-    root = Path(__file__).parent.parent
-    parent = str(root.parent)
-    if parent not in sys.path:
-        sys.path.insert(0, parent)
-
-    pkg = types.ModuleType("astrbot_plugin_nju_qa")
-    pkg.__path__ = [str(root)]
-    sys.modules["astrbot_plugin_nju_qa"] = pkg
-
-    import nju_qa
-
-    sys.modules["astrbot_plugin_nju_qa.nju_qa"] = nju_qa
-
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location(
-        "astrbot_plugin_nju_qa.main", root / "main.py"
-    )
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["astrbot_plugin_nju_qa.main"] = mod
-    spec.loader.exec_module(mod)
-    return mod.NjuQaPlugin
-
-
-class _FakeAgent:
-    async def answer(self, event, prompt):
-        return f"答案：{prompt}"
-
-
-class _FakeEvent:
-    def __init__(self, group_id=None, sender_id="u1", text="nju test"):
-        self.group_id = group_id
-        self.sender_id = sender_id
-        self.message_str = text
-        self.unified_msg_origin = "test:session"
-        self.stopped = False
-
-    def get_group_id(self):
-        return self.group_id
-
-    def get_sender_id(self):
-        return self.sender_id
-
-    def get_self_id(self):
-        return "bot"
-
-    def stop_event(self):
-        self.stopped = True
-
-    def plain_result(self, text):
-        return text
-
-
-def _make_plugin(plugin_class, tmp_path, group_limit=2, private_limit=2):
-    class TestPlugin(plugin_class):
-        def __init__(self, data_dir, config):
-            self.data_dir = data_dir
-            super().__init__(context=object(), config=config)
-            self.agent = _FakeAgent()
-
-    config = PluginConfig.from_mapping(
-        {
-            "yuque_token": "x",
-            "yuque_repositories": ["nju/guide"],
-            "group_rate_limit": group_limit,
-            "group_rate_limit_window": 3600,
-            "private_rate_limit": private_limit,
-            "private_rate_limit_window": 3600,
-        }
-    )
-    return TestPlugin(tmp_path, config)
-
-
-async def _collect(generator):
-    return [item async for item in generator]
-
-
 def test_group_handler_blocks_after_limit(plugin_class, tmp_path):
     plugin = _make_plugin(plugin_class, tmp_path, group_limit=2)
     event = _FakeEvent(group_id="g1", text="nju hello")
@@ -276,18 +189,19 @@ def test_admin_commands_are_not_rate_limited(plugin_class, tmp_path):
     assert "已启动后台同步" in result[0]
 
     index_event = _FakeEvent(group_id="g1", text="nju_index rebuild")
-    result = asyncio.run(_collect(plugin.nju_index(index_event)))
+    result = asyncio.run(_collect(plugin.nju_index(index_event, action="rebuild")))
     assert "已启动后台索引重建" in result[0]
 
     search_event = _FakeEvent(group_id="g1", text="nju_search test")
-    result = asyncio.run(_collect(plugin.nju_search(search_event)))
+    result = asyncio.run(_collect(plugin.nju_search(search_event, query="test")))
     # nju_search may return "知识库为空" or a debug report; the point is it did not
     # hit the rate-limit message.
     assert "提问上限" not in result[0]
 
     debug_event = _FakeEvent(group_id="g1", text="nju_debug")
     result = asyncio.run(_collect(plugin.nju_debug(debug_event)))
-    assert "message_str" in result[0]
+    assert "handler_arg" in result[0]
+    assert "matched_source" in result[0]
 
 
 def test_nju_handler_ignores_other_commands(plugin_class, tmp_path):
