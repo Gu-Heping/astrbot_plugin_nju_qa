@@ -9,7 +9,12 @@ from pathlib import Path
 from astrbot.api import logger
 
 from .doc_utils import read_document_content
-from .models import SearchResult
+from .evidence import (
+    grep_hits_to_search_results,
+    merge_search_results,
+    select_grounding_sources,
+)
+from .models import ChunkResult, Document, SearchResult
 from .prompts import AGENT_SYSTEM_PROMPT
 
 
@@ -38,13 +43,23 @@ class SourceTracker:
         self.verified_urls.update(re.findall(r"https?://[^\s<>()，。；：]+", content))
 
     def add(self, results: list[SearchResult]) -> None:
-        known = {item.document.yuque_id for item in self.sources}
+        """Add or merge retrieval results into the unified evidence list."""
+        by_id: dict[str, int] = {
+            item.document.yuque_id: i for i, item in enumerate(self.sources)
+        }
         for item in results:
-            if item.document.yuque_id not in known:
+            if not item.document.yuque_id:
+                # Documents without a stable id are appended as-is (rare).
                 self.sources.append(item)
-                known.add(item.document.yuque_id)
-            # URLs appearing in retrieved snippets are also considered verified,
-            # so the model can cite inline links from the knowledge base.
+                continue
+            idx = by_id.get(item.document.yuque_id)
+            if idx is None:
+                self.sources.append(item)
+                by_id[item.document.yuque_id] = len(self.sources) - 1
+            else:
+                merged = merge_search_results(self.sources[idx], item)
+                self.sources[idx] = merged
+                by_id[item.document.yuque_id] = idx
             content = (
                 item.chunk.content_snippet
                 if item.chunk
@@ -52,6 +67,84 @@ class SourceTracker:
             )
             if content:
                 self.record_read_content(content)
+
+    def add_grep_hits(self, hits: list[dict], query_terms: list[str]) -> None:
+        """Convert grep hits into unified evidence and register them."""
+        self.add(grep_hits_to_search_results(hits, query_terms))
+
+    def add_read_document(self, document: Document, content: str) -> None:
+        """Mark a document as read and ensure it exists in the evidence list."""
+        key = str(document.path or document.yuque_id)
+        self.read_sources.add(key)
+        self.record_read_content(content)
+        if not document.yuque_id:
+            return
+        # Merge with any existing evidence for the same document.
+        existing_idx = next(
+            (
+                i
+                for i, s in enumerate(self.sources)
+                if s.document.yuque_id == document.yuque_id
+            ),
+            None,
+        )
+        if existing_idx is None:
+            self.add(
+                [
+                    SearchResult(
+                        source_id=f"R{len(self.sources) + 1}",
+                        document=document,
+                        score=1.0,
+                        chunk=None,
+                        retrieval_methods=("read",),
+                        reliable=True,
+                    )
+                ]
+            )
+        else:
+            existing = self.sources[existing_idx]
+            merged_document = document
+            if len(existing.document.body) > len(document.body):
+                merged_document = existing.document
+            read_chunk = (
+                existing.chunk
+                or ChunkResult(
+                    chunk_id=f"read:{document.yuque_id}",
+                    document_id=document.yuque_id,
+                    title=document.title,
+                    content_snippet=content[:2400],
+                    source_url=document.url,
+                    final_score=existing.score,
+                    retrieval_methods=("read",),
+                    reliable=existing.reliable,
+                    file_path=str(document.path or ""),
+                    slug=document.slug,
+                    namespace=document.namespace,
+                )
+            )
+            self.sources[existing_idx] = SearchResult(
+                source_id=existing.source_id,
+                document=merged_document,
+                score=existing.score,
+                chunk=read_chunk,
+                keyword_score=existing.keyword_score,
+                retrieval_methods=tuple(
+                    dict.fromkeys([*existing.retrieval_methods, "read"])
+                ),
+                reliable=existing.reliable,
+            )
+
+    @property
+    def reliable_count(self) -> int:
+        return sum(1 for s in self.sources if s.reliable)
+
+    @property
+    def matched_count(self) -> int:
+        return len(self.sources)
+
+    @property
+    def read_count(self) -> int:
+        return len(self.read_sources)
 
 
 def _is_pure_no_evidence(text: str) -> bool:
@@ -187,10 +280,13 @@ class NjuQaAgent:
             return AGENT_ERROR
         text = str(getattr(response, "completion_text", "")).strip()
         logger.info(
-            "NJU agent first response: length=%d sources=%d reliable=%d",
+            "NJU agent first response: length=%d sources=%d reliable=%d "
+            "matched=%d read=%d",
             len(text),
             len(tracker.sources),
-            sum(1 for s in tracker.sources if s.reliable),
+            tracker.reliable_count,
+            tracker.matched_count,
+            tracker.read_count,
         )
 
         if not requires_campus_evidence(prompt):
@@ -208,7 +304,12 @@ class NjuQaAgent:
 
         # Ground the answer in the most relevant chunk snippets.
         self._record_selected_documents(tracker)
-        logger.info("NJU agent grounding with %d sources", len(tracker.sources[:_MAX_GROUNDING_SOURCES]))
+        logger.info(
+            "NJU agent grounding: selected=%d sources=%d reliable=%d",
+            len(select_grounding_sources(tracker.sources, max_sources=_MAX_GROUNDING_SOURCES)),
+            len(tracker.sources),
+            tracker.reliable_count,
+        )
         response = await self._run_tool_loop(
             event=event,
             chat_provider_id=provider_id,
@@ -220,8 +321,15 @@ class NjuQaAgent:
         if not tracker.read_sources:
             logger.info("NJU agent: no documents were read during grounding")
             return NO_EVIDENCE
-        result = append_verified_citations(text, tracker.sources, tracker.verified_urls)
-        logger.info("NJU agent grounded answer: length=%d sources=%d", len(result), len(tracker.sources))
+        result = append_verified_citations(
+            text, tracker.sources, tracker.verified_urls
+        )
+        logger.info(
+            "NJU agent grounded answer: length=%d sources=%d reliable=%d",
+            len(result),
+            len(tracker.sources),
+            tracker.reliable_count,
+        )
         return result
 
     def _read_source_body(self, source: SearchResult, limit: int = 8000) -> str:
@@ -245,17 +353,22 @@ class NjuQaAgent:
             )
 
     def _record_selected_documents(self, tracker: SourceTracker) -> None:
-        """Mark top sources as read and extract URLs from their content."""
-        for source in tracker.sources[:_MAX_GROUNDING_SOURCES]:
+        """Mark grounding sources as read and extract URLs from their content."""
+        for source in select_grounding_sources(
+            tracker.sources, max_sources=_MAX_GROUNDING_SOURCES
+        ):
             tracker.read_sources.add(
                 str(source.document.path or source.document.yuque_id)
             )
             tracker.record_read_content(self._read_source_body(source))
 
     def _grounded_prompt(self, question: str, tracker: SourceTracker) -> str:
+        sources = select_grounding_sources(
+            tracker.sources, max_sources=_MAX_GROUNDING_SOURCES
+        )
         materials = "\n\n".join(
             f"[已读材料 {i}]《{source.document.title}》（{source.document.url}）\n{self._read_source_body(source, limit=8000)}"
-            for i, source in enumerate(tracker.sources[:_MAX_GROUNDING_SOURCES], 1)
+            for i, source in enumerate(sources, 1)
         )
         return f"""请回答原问题：{question}
 

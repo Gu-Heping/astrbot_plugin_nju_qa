@@ -3,7 +3,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
-from astrbot.api import FunctionTool
+from astrbot.api import FunctionTool, logger
 from astrbot.api.event import AstrMessageEvent
 from ..doc_utils import (
     _load_cleaned_document_lines,
@@ -11,6 +11,11 @@ from ..doc_utils import (
     parse_yuque_doc_url,
     read_document_content,
     read_document_lines,
+)
+from ..evidence import (
+    document_from_index_row,
+    evaluate_grep_reliability,
+    score_grep_hit,
 )
 
 
@@ -74,10 +79,19 @@ class GrepLocalDocsTool(_Tool):
                 ]
                 hits = self._search(split_terms, repo_filter, context_lines, limit)
         if self.tracker:
-            for hit in hits:
-                self.tracker.read_sources.add(hit["path"])
-                for match in hit.get("matches", []):
-                    self.tracker.record_read_content(match.get("snippet", ""))
+            # Re-rank and register as unified evidence.
+            hits = sorted(hits, key=lambda h: score_grep_hit(h, terms), reverse=True)
+            reliable_count = sum(
+                1 for h in hits if evaluate_grep_reliability(h, terms)[0]
+            )
+            logger.info(
+                "NJU grep evidence: query=%r hits=%d reliable=%d tracked=%d",
+                keywords,
+                len(hits),
+                reliable_count,
+                len(self.tracker.sources),
+            )
+            self.tracker.add_grep_hits(hits, terms)
         return {"count": len(hits), "results": hits}
 
     def _search(
@@ -155,13 +169,21 @@ class GrepLocalDocsTool(_Tool):
                     }
                 )
 
-            # Simple score: term coverage + density of matched lines.
-            score = len(matched_terms) / max(len(terms), 1) + len(matched_indices) * 0.1
             public = doc_record_to_public_dict(row)
             hits.append(
                 {
                     **public,
-                    "score": round(score, 3),
+                    "score": round(
+                        score_grep_hit(
+                            {
+                                **public,
+                                "matched_keywords": sorted(matched_terms),
+                                "matches": matches,
+                            },
+                            terms,
+                        ),
+                        3,
+                    ),
                     "matched_keywords": sorted(matched_terms),
                     "matches": matches[:3],
                 }
@@ -221,8 +243,21 @@ class ReadDocTool(_Tool):
         except ValueError as exc:
             return {"error": str(exc), "file_path": file_path}
         if self.tracker:
-            self.tracker.read_sources.add(file_path)
-            self.tracker.record_read_content(result["content"])
+            resolved_path = result.get("file_path", file_path)
+            row = next(
+                (
+                    r
+                    for r in self.index.all_documents()
+                    if r["path"] == resolved_path
+                ),
+                None,
+            )
+            if row is not None:
+                document = document_from_index_row(row, result["content"])
+                self.tracker.add_read_document(document, result["content"])
+            else:
+                self.tracker.read_sources.add(resolved_path)
+                self.tracker.record_read_content(result["content"])
         return result
 
 
@@ -319,8 +354,16 @@ class GetDocDetailsTool(_Tool):
                 "file_path": results[0]["path"],
             }
         if self.tracker:
-            self.tracker.read_sources.add(results[0]["path"])
-            self.tracker.record_read_content(result["content"])
+            row = next(
+                (r for r in rows if r["path"] == results[0]["path"]),
+                None,
+            )
+            if row is not None:
+                document = document_from_index_row(row, result["content"])
+                self.tracker.add_read_document(document, result["content"])
+            else:
+                self.tracker.read_sources.add(results[0]["path"])
+                self.tracker.record_read_content(result["content"])
         return result
 
 
