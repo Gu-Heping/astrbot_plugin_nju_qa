@@ -31,11 +31,13 @@ class SourceTracker:
 
     def __init__(self) -> None:
         self.sources: list[SearchResult] = []
+        self.selected_sources: list[SearchResult] = []
         self.read_sources: set[str] = set()
         self.verified_urls: set[str] = set()
 
     def reset(self) -> None:
         self.sources.clear()
+        self.selected_sources.clear()
         self.read_sources.clear()
         self.verified_urls.clear()
 
@@ -89,6 +91,9 @@ class SourceTracker:
             None,
         )
         if existing_idx is None:
+            # A document that is read without prior retrieval evidence is
+            # registered, but it does not automatically become reliable just
+            # because it was opened.
             self.add(
                 [
                     SearchResult(
@@ -97,7 +102,7 @@ class SourceTracker:
                         score=1.0,
                         chunk=None,
                         retrieval_methods=("read",),
-                        reliable=True,
+                        reliable=False,
                     )
                 ]
             )
@@ -302,11 +307,21 @@ class NjuQaAgent:
             logger.info("NJU agent: no reliable sources for campus question")
             return NO_EVIDENCE
 
-        # Ground the answer in the most relevant chunk snippets.
+        # For campus-factual questions, require reliable sources.
+        reliable_sources = [s for s in tracker.sources if s.reliable]
+        if not reliable_sources:
+            logger.info("NJU agent: no reliable sources for campus question")
+            return NO_EVIDENCE
+
+        # Ground the answer in the most relevant *reliable* sources.  This
+        # selection is reused for the prompt, URL whitelist, and citations.
+        tracker.selected_sources = select_grounding_sources(
+            reliable_sources, max_sources=_MAX_GROUNDING_SOURCES
+        )
         self._record_selected_documents(tracker)
         logger.info(
             "NJU agent grounding: selected=%d sources=%d reliable=%d",
-            len(select_grounding_sources(tracker.sources, max_sources=_MAX_GROUNDING_SOURCES)),
+            len(tracker.selected_sources),
             len(tracker.sources),
             tracker.reliable_count,
         )
@@ -322,12 +337,12 @@ class NjuQaAgent:
             logger.info("NJU agent: no documents were read during grounding")
             return NO_EVIDENCE
         result = append_verified_citations(
-            text, tracker.sources, tracker.verified_urls
+            text, tracker.selected_sources, tracker.verified_urls
         )
         logger.info(
-            "NJU agent grounded answer: length=%d sources=%d reliable=%d",
+            "NJU agent grounded answer: length=%d selected=%d reliable=%d",
             len(result),
-            len(tracker.sources),
+            len(tracker.selected_sources),
             tracker.reliable_count,
         )
         return result
@@ -353,30 +368,27 @@ class NjuQaAgent:
             )
 
     def _record_selected_documents(self, tracker: SourceTracker) -> None:
-        """Mark grounding sources as read and extract URLs from their content."""
-        for source in select_grounding_sources(
-            tracker.sources, max_sources=_MAX_GROUNDING_SOURCES
-        ):
+        """Mark the already-selected grounding sources as read and extract URLs."""
+        for source in tracker.selected_sources:
             tracker.read_sources.add(
                 str(source.document.path or source.document.yuque_id)
             )
             tracker.record_read_content(self._read_source_body(source))
 
     def _grounded_prompt(self, question: str, tracker: SourceTracker) -> str:
-        sources = select_grounding_sources(
-            tracker.sources, max_sources=_MAX_GROUNDING_SOURCES
-        )
+        sources = tracker.selected_sources
         materials = "\n\n".join(
             f"[已读材料 {i}]《{source.document.title}》（{source.document.url}）\n{self._read_source_body(source, limit=8000)}"
             for i, source in enumerate(sources, 1)
         )
         return f"""请回答原问题：{question}
 
-我已为你读取了以下最相关的知识库文档（或片段）。请优先根据这些材料作答：
-- 材料中明确提到的具体事项，直接整理成条理清晰的答案；
-- 材料中没有提到的具体事项直接略过，不要单独列出“未找到”或“未提及”的事项清单；
-- 如果某个材料明显不足，可以调用 read_doc(file_path) 读取完整文档，但只读取已列出的文档；
-- 不要自行输出链接或来源列表，系统会自动附加。
+我已为你读取了以下最相关的知识库文档（或片段）。请严格根据这些材料作答：
+- 只回答用户实际询问的事项；用户未指定需要逐校区穷举时，不要主动列出材料未覆盖的校区；材料未提及的校区、流程或建议直接略过；不得自行建议前往其他校区办理，除非材料明确支持。
+- 地点、时间、费用、校区等条件必须与对应材料绑定；不同来源或校区信息不一致时，不得合并成一个统一结论，可分别说明或提示资料存在版本差异。
+- 若材料为历史归档或包含具体年份/截止日期，不要把该截止日期当作当前截止日期；可说明历年操作路径，但提醒以本年度通知为准。
+- 材料中明确提到的具体事项，直接整理成条理清晰的答案；材料中没有提到的具体事项直接略过，不要单独列出“未找到”或“未提及”的事项清单。
+- 如果某个材料明显不足，可以调用 read_doc(file_path) 读取完整文档，但只读取已列出的文档；不要自行输出链接或来源列表，系统会自动附加。
 
 {materials}"""
 

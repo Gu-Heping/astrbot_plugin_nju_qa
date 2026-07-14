@@ -181,8 +181,8 @@ def test_grep_reliability_direct_answer_is_reliable(sample_hits):
         sample_hits["direct"], ["校园卡", "补办"]
     )
     assert reliable is True
-    assert diag["coverage"] == 1.0
-    assert diag["same_window_full_coverage"] is True
+    assert diag["core_coverage"] == 1.0
+    assert diag["same_window_core_coverage"] is True
 
 
 def test_grep_reliability_partial_keyword_is_not_reliable(sample_hits):
@@ -206,7 +206,7 @@ def test_grep_reliability_no_answer_status_is_unreliable():
     )
     reliable, diag = evaluate_grep_reliability(hit, ["校园卡", "补办"])
     assert reliable is False
-    assert diag["all_no_answer_found"] is True
+    assert diag["qa_status"] == "no_answer"
 
 
 def test_grep_reliability_resolved_status_is_reliable():
@@ -252,8 +252,8 @@ def test_grep_same_window_coverage_outranks_split_match():
     assert score_grep_hit(together, terms) > score_grep_hit(split, terms)
     _, diag_together = evaluate_grep_reliability(together, terms)
     _, diag_split = evaluate_grep_reliability(split, terms)
-    assert diag_together["same_window_full_coverage"] is True
-    assert diag_split["same_window_full_coverage"] is False
+    assert diag_together["same_window_core_coverage"] is True
+    assert diag_split["same_window_core_coverage"] is False
 
 
 def test_grep_hits_convert_to_search_results():
@@ -308,19 +308,23 @@ def test_source_tracker_deduplicates_by_yuque_id():
     assert tracker.sources[0].retrieval_methods == ("grep", "keyword")
 
 
-def test_select_grounding_sources_prefers_reliable():
-    doc = Document(
-        "d", "t", "r", "n", "s", "u", "a", "b", "body", path=Path("p.md")
-    )
+def test_select_grounding_sources_prefers_reliable_and_drops_unreliable():
+    def make(source_id: str, score: float, reliable: bool, yuque_id: str):
+        doc = Document(
+            yuque_id, "t", "r", "n", "s", "u", "a", "b", "body", path=Path(f"{yuque_id}.md")
+        )
+        return SearchResult(source_id, doc, score, reliable=reliable)
+
     sources = [
-        SearchResult("S1", doc, 0.9, reliable=False),
-        SearchResult("S2", doc, 0.6, reliable=True),
-        SearchResult("S3", doc, 0.3, reliable=True),
+        make("S1", 0.9, False, "d1"),
+        make("S2", 0.6, True, "d2"),
+        make("S3", 0.3, True, "d3"),
     ]
     selected = select_grounding_sources(sources, max_sources=2)
     assert len(selected) == 2
     assert selected[0].source_id == "S2"
     assert selected[1].source_id == "S3"
+    assert all(s.reliable for s in selected)
 
 
 def test_document_from_index_row():

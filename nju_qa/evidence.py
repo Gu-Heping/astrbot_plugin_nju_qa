@@ -3,10 +3,77 @@
 from __future__ import annotations
 
 import re
-from dataclasses import replace
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
+from enum import Enum
 from pathlib import Path
 
 from .models import ChunkResult, Document, SearchResult
+
+
+# Lightweight action synonym dictionary.  Keep it small and testable.
+_ACTION_SYNONYMS: dict[str, frozenset[str]] = {
+    "补办": frozenset({"补办", "补卡", "重办"}),
+    "挂失": frozenset({"挂失", "丢失"}),
+    "上传": frozenset({"上传", "采集", "提交"}),
+    "查询": frozenset({"查询", "查看"}),
+    "领取": frozenset({"领取", "发放"}),
+    "办理": frozenset({"办理", "申请"}),
+}
+
+_MODIFIER_TERMS: frozenset[str] = frozenset({
+    "哪里",
+    "在哪",
+    "地点",
+    "位置",
+    "怎么",
+    "如何",
+    "多少",
+    "时间",
+    "什么时候",
+    "要求",
+    "流程",
+    "方式",
+    "办法",
+    "入口",
+    "网址",
+    "地址",
+})
+
+# Aliases only affect modifier scoring; they never become part of the core
+# coverage that gates reliability.
+_MODIFIER_ALIASES: dict[str, tuple[str, ...]] = {
+    "地点": ("位于", "地址", "前往", "放置", "服务大厅", "办理处"),
+    "时间": ("工作时间", "开放时间", "几点", "时至", "期间"),
+    "网址": ("入口", "网站", "链接", "访问", "平台"),
+    "怎么": ("如何",),
+    "多少": ("费用", "元", "钱"),
+}
+
+# Known objects that are often confused with the query subject.  When one of
+# these objects takes the action instead of the real subject, the hit must be
+# penalised.
+_COMPETING_OBJECTS: tuple[str, ...] = (
+    "学生证",
+    "团员证",
+    "身份证",
+    "宿舍钥匙",
+    "银行卡",
+    "火车优惠卡",
+)
+
+_QA_SEPARATORS = re.compile(r"(?:^|\n)\s*(?:###|##|---|\*\*Q\d+|Q\d+)\s*", re.IGNORECASE)
+
+_NO_ANSWER_MARKERS: tuple[str, ...] = (
+    "no_answer_found",
+    "暂无可靠答案",
+    "暂无可用答案",
+    "没有可靠答案",
+    "待补充",
+    "原答案已在最终筛选中剔除",
+    "不可作为回答材料",
+    "无答案",
+)
 
 _QA_STATUSES = (
     "resolved",
@@ -14,6 +81,41 @@ _QA_STATUSES = (
     "partially_resolved",
     "no_answer_found",
 )
+
+
+@dataclass(frozen=True)
+class QueryIntentTerms:
+    """A deterministic split of the user's query.
+
+    * subject_terms  -- what the question is about (e.g. 校园卡).
+    * action_terms   -- what the user wants to do (e.g. 补办).
+    * modifier_terms -- answer-type hints (e.g. 地点, 时间).
+    * original_terms -- raw terms from the tool call.
+    """
+
+    subject_terms: tuple[str, ...]
+    action_terms: tuple[str, ...]
+    modifier_terms: tuple[str, ...]
+    original_terms: tuple[str, ...]
+
+    @property
+    def core_terms(self) -> tuple[str, ...]:
+        return self.subject_terms + self.action_terms
+
+    @property
+    def action_expanded(self) -> frozenset[str]:
+        """All surface forms for the requested actions."""
+        result: set[str] = set()
+        for canonical in self.action_terms:
+            result.update(_ACTION_SYNONYMS.get(canonical, {canonical}))
+        return frozenset(result)
+
+
+class QaEvidenceStatus(Enum):
+    RELIABLE = "reliable"
+    PARTIAL = "partial"
+    NO_ANSWER = "no_answer"
+    UNKNOWN = "unknown"
 
 
 def _normalize(text: str) -> str:
@@ -24,6 +126,41 @@ def _normalize(text: str) -> str:
 def _extract_terms(query: str) -> list[str]:
     """Return non-empty whitespace-separated terms."""
     return [t for t in query.split() if t]
+
+
+def _canonical_action(term: str) -> str | None:
+    """Return the canonical action name if ``term`` is an action synonym."""
+    low = _normalize(term)
+    for canonical, synonyms in _ACTION_SYNONYMS.items():
+        if low == _normalize(canonical) or low in {_normalize(s) for s in synonyms}:
+            return canonical
+    return None
+
+
+def parse_query_terms(terms: Sequence[str]) -> QueryIntentTerms:
+    """Split raw query terms into subject / action / modifier buckets."""
+    subject_terms: list[str] = []
+    action_terms: list[str] = []
+    modifier_terms: list[str] = []
+
+    for term in terms:
+        canonical = _canonical_action(term)
+        if canonical is not None:
+            if canonical not in action_terms:
+                action_terms.append(canonical)
+        elif _normalize(term) in {_normalize(m) for m in _MODIFIER_TERMS}:
+            if term not in modifier_terms:
+                modifier_terms.append(term)
+        else:
+            if term not in subject_terms:
+                subject_terms.append(term)
+
+    return QueryIntentTerms(
+        subject_terms=tuple(subject_terms),
+        action_terms=tuple(action_terms),
+        modifier_terms=tuple(modifier_terms),
+        original_terms=tuple(terms),
+    )
 
 
 def _combine_grep_snippets(hit: dict) -> str:
@@ -45,21 +182,30 @@ def _window_texts(hit: dict) -> list[str]:
     ]
 
 
-def _window_status(text: str) -> str | None:
-    """Detect QA status markers inside a snippet window."""
-    lower = _normalize(text)
-    for status in _QA_STATUSES:
-        if status in lower:
-            return status
-    return None
-
-
-def _is_index_document(title: str) -> bool:
+def _is_index_document(title: str, path: str | None = None) -> bool:
     """Heuristic for directory / table-of-contents documents."""
     lower = _normalize(title)
-    if re.search(r"(^|[/_-])index\b|\\b目录\\b|\\btoc\\b|^00[_-]", lower):
+    if re.search(r"(^|[/_-])index\b|\b目录\b|\btoc\b|^00[_-]", lower):
+        return True
+    if path and "index" in Path(path).name.lower():
         return True
     return lower.startswith("00_")
+
+
+def is_historical_document(title: str, path: str | None = None) -> tuple[bool, float]:
+    """Return (is_historical, penalty).
+
+    Historical / archived documents can still be useful, but they must not be
+    treated as the primary current answer.
+    """
+    lower = _normalize(title)
+    if re.search(r"\b20\d{2}\b", lower):
+        return True, 0.4
+    if path and "归档" in path.casefold():
+        return True, 0.5
+    if "未更新" in lower:
+        return True, 0.3
+    return False, 0.0
 
 
 def build_document_from_grep_hit(hit: dict) -> Document:
@@ -94,105 +240,411 @@ def document_from_index_row(row, body: str = "") -> Document:
     )
 
 
+def _find_positions(text: str, terms: Sequence[str]) -> list[tuple[int, int]]:
+    """Return (start, end) positions of every occurrence of ``terms``."""
+    positions: list[tuple[int, int]] = []
+    for term in terms:
+        if not term:
+            continue
+        t = _normalize(term)
+        start = 0
+        while True:
+            idx = text.find(t, start)
+            if idx == -1:
+                break
+            positions.append((idx, idx + len(t)))
+            start = idx + 1
+    return positions
+
+
+def detect_competing_object(
+    text: str,
+    *,
+    subject_terms: Sequence[str],
+    action_terms: Sequence[str],
+) -> bool:
+    """Return True when an action is bound to a different object than the subject."""
+    norm = _normalize(text)
+    subjects = [t for t in subject_terms if t]
+    actions = [t for t in action_terms if t]
+    if not subjects or not actions:
+        return False
+
+    subj_positions = _find_positions(norm, subjects)
+
+    for obj in _COMPETING_OBJECTS:
+        obj_low = _normalize(obj)
+        for obj_match in re.finditer(re.escape(obj_low), norm):
+            for action in actions:
+                act_low = _normalize(action)
+                for act_match in re.finditer(re.escape(act_low), norm):
+                    # Adjacent within 4 characters counts as bound.
+                    gap = min(
+                        abs(obj_match.start() - act_match.end()),
+                        abs(act_match.start() - obj_match.end()),
+                    )
+                    if gap > 4:
+                        continue
+                    span_start = min(obj_match.start(), act_match.start())
+                    span_end = max(obj_match.end(), act_match.end())
+                    # If the real subject is inside the same span, this is not
+                    # a competing object phrase.
+                    if any(
+                        span_start <= start and end <= span_end
+                        for start, end in subj_positions
+                    ):
+                        continue
+                    return True
+    return False
+
+
+def subject_action_relevance(
+    text: str,
+    *,
+    subject_terms: Sequence[str],
+    action_terms: Sequence[str],
+) -> float:
+    """Score how tightly the subject and action are related in ``text``.
+
+    Returns a value in [0.0, 1.0].  A high score requires the action to be
+    close to the real subject, and not bound to a competing object.
+    """
+    norm = _normalize(text)
+    subjects = [t for t in subject_terms if t]
+    actions = [t for t in action_terms if t]
+    if not subjects or not actions:
+        return 0.0
+
+    subj_positions = _find_positions(norm, subjects)
+    act_positions = _find_positions(norm, actions)
+    if not subj_positions or not act_positions:
+        return 0.0
+
+    min_gap = min(
+        abs(s[1] - a[0]) for s in subj_positions for a in act_positions
+    )
+
+    if min_gap <= 6:
+        score = 1.0
+    elif min_gap <= 15:
+        score = 0.8
+    elif min_gap <= 40:
+        score = 0.5
+    else:
+        score = 0.2
+
+    if detect_competing_object(
+        text, subject_terms=subjects, action_terms=actions
+    ):
+        score = max(0.0, score - 0.7)
+
+    return score
+
+
+def _core_coverage(body_norm: str, intent: QueryIntentTerms) -> float:
+    """Fraction of core terms (subject + action) matched anywhere in the body.
+
+    Action synonyms count as matches for the canonical action.
+    """
+    core_count = len(intent.core_terms)
+    if core_count == 0:
+        return 0.0
+
+    matched_subjects = sum(
+        1 for s in intent.subject_terms if _normalize(s) in body_norm
+    )
+    matched_actions = sum(
+        1
+        for a in intent.action_terms
+        if any(
+            _normalize(syn) in body_norm
+            for syn in _ACTION_SYNONYMS.get(a, {a})
+        )
+    )
+    return (matched_subjects + matched_actions) / core_count
+
+
+def _same_window_core_coverage(
+    windows: list[str], intent: QueryIntentTerms
+) -> bool:
+    """Return True when one window contains all core terms (action synonyms OK)."""
+    if not intent.core_terms:
+        return False
+
+    for window in windows:
+        norm = _normalize(window)
+        subjects_ok = all(
+            _normalize(s) in norm for s in intent.subject_terms
+        )
+        actions_ok = all(
+            any(
+                _normalize(syn) in norm
+                for syn in _ACTION_SYNONYMS.get(a, {a})
+            )
+            for a in intent.action_terms
+        )
+        if subjects_ok and actions_ok:
+            return True
+    return False
+
+
+def _relation_flags(
+    text: str, intent: QueryIntentTerms
+) -> tuple[bool, bool]:
+    """Return (exact_target_phrase, target_phrase) for ``text``.
+
+    An "exact" phrase keeps subject and action within 8 characters.
+    A "target" phrase keeps them within 15 characters.
+    """
+    norm = _normalize(text)
+    if not intent.subject_terms or not intent.action_terms:
+        return False, False
+
+    subj_positions = _find_positions(norm, intent.subject_terms)
+    act_positions = _find_positions(norm, intent.action_expanded)
+    if not subj_positions or not act_positions:
+        return False, False
+
+    min_gap = min(
+        abs(s[1] - a[0]) for s in subj_positions for a in act_positions
+    )
+    return min_gap <= 8, min_gap <= 15
+
+
+def classify_qa_window(text: str) -> QaEvidenceStatus:
+    """Classify a single QA window, with no-answer markers taking priority."""
+    lower = _normalize(text)
+
+    # Negative markers must be checked first.
+    for marker in _NO_ANSWER_MARKERS:
+        if re.search(re.escape(_normalize(marker)), lower):
+            return QaEvidenceStatus.NO_ANSWER
+
+    if re.search(r"\breviewed_resolved\b", lower):
+        return QaEvidenceStatus.RELIABLE
+    if re.search(r"\bresolved\b", lower):
+        return QaEvidenceStatus.RELIABLE
+    if re.search(r"\bpartially_resolved\b", lower):
+        return QaEvidenceStatus.PARTIAL
+
+    return QaEvidenceStatus.UNKNOWN
+
+
+def _block_is_relevant(block: str, intent: QueryIntentTerms) -> bool:
+    """A QA block is relevant only when it contains all core terms."""
+    norm = _normalize(block)
+    subjects_ok = all(_normalize(s) in norm for s in intent.subject_terms)
+    actions_ok = all(
+        any(
+            _normalize(syn) in norm
+            for syn in _ACTION_SYNONYMS.get(a, {a})
+        )
+        for a in intent.action_terms
+    )
+    return subjects_ok and actions_ok
+
+
+def _qa_status_for_window(
+    window: str, intent: QueryIntentTerms
+) -> QaEvidenceStatus:
+    """Classify a window, splitting on QA boundaries and using relevant blocks."""
+    blocks = [b.strip() for b in _QA_SEPARATORS.split(window) if b.strip()]
+    if not blocks:
+        blocks = [window]
+
+    relevant = [b for b in blocks if _block_is_relevant(b, intent)]
+    if not relevant:
+        relevant = blocks
+
+    statuses = [classify_qa_window(b) for b in relevant]
+    if any(s is QaEvidenceStatus.NO_ANSWER for s in statuses):
+        return QaEvidenceStatus.NO_ANSWER
+    if any(s is QaEvidenceStatus.RELIABLE for s in statuses):
+        return QaEvidenceStatus.RELIABLE
+    if any(s is QaEvidenceStatus.PARTIAL for s in statuses):
+        return QaEvidenceStatus.PARTIAL
+    return QaEvidenceStatus.UNKNOWN
+
+
+def _overall_qa_status(
+    windows: list[str], intent: QueryIntentTerms
+) -> QaEvidenceStatus:
+    """Aggregate QA status across windows.  One no-answer window disables reliability."""
+    if not windows:
+        return QaEvidenceStatus.UNKNOWN
+    statuses = [_qa_status_for_window(w, intent) for w in windows]
+    if any(s is QaEvidenceStatus.NO_ANSWER for s in statuses):
+        return QaEvidenceStatus.NO_ANSWER
+    if any(s is QaEvidenceStatus.RELIABLE for s in statuses):
+        return QaEvidenceStatus.RELIABLE
+    if any(s is QaEvidenceStatus.PARTIAL for s in statuses):
+        return QaEvidenceStatus.PARTIAL
+    return QaEvidenceStatus.UNKNOWN
+
+
+def _modifier_coverage(body_norm: str, intent: QueryIntentTerms) -> float:
+    """Fraction of explicit modifier terms (or their aliases) matched."""
+    if not intent.modifier_terms:
+        return 0.0
+    matched = 0
+    for term in intent.modifier_terms:
+        if _normalize(term) in body_norm:
+            matched += 1
+            continue
+        aliases = _MODIFIER_ALIASES.get(term, ())
+        if any(_normalize(a) in body_norm for a in aliases):
+            matched += 1
+    return matched / len(intent.modifier_terms)
+
+
 def evaluate_grep_reliability(hit: dict, query_terms: list[str]) -> tuple[bool, dict]:
     """Return (reliable, diagnostics) for a grep hit.
 
-    Reliability requires real content and meaningful keyword coverage.  It does
-    not blindly trust every line that mentions one of the query words.
+    Reliability depends on core term coverage, subject-action binding, and
+    QA status.  Modifiers are intentionally not required.
     """
-    terms = [_normalize(t) for t in query_terms if t]
-    if not terms:
-        return False, {"reason": "no_terms"}
+    intent = parse_query_terms(query_terms)
+    if not intent.core_terms:
+        return False, {"reason": "no_core_terms"}
 
-    matched = {_normalize(t) for t in hit.get("matched_keywords", [])}
-    coverage = len(matched) / len(terms)
     windows = _window_texts(hit)
     if not windows:
-        return False, {"coverage": coverage, "reason": "no_windows"}
+        return False, {"reason": "no_windows"}
 
-    same_window_full = any(
-        all(term in _normalize(window) for term in terms) for window in windows
+    body = _combine_grep_snippets(hit)
+    body_norm = _normalize(body)
+    title = hit.get("title", "")
+
+    core_coverage = _core_coverage(body_norm, intent)
+    subj_action = subject_action_relevance(
+        body, subject_terms=intent.subject_terms, action_terms=intent.action_expanded
     )
-    phrase = " ".join(query_terms)
-    exact_phrase_match = any(phrase in window for window in windows)
-
-    title = _normalize(hit.get("title", ""))
-    title_all_terms = all(term in title for term in terms)
-    title_any_term = any(term in title for term in terms)
-    is_index = _is_index_document(hit.get("title", ""))
-
-    statuses = [_window_status(window) for window in windows]
-    has_resolved = any(
-        status in ("resolved", "reviewed_resolved") for status in statuses
+    title_action = subject_action_relevance(
+        title, subject_terms=intent.subject_terms, action_terms=intent.action_expanded
     )
-    all_no_answer = statuses and all(
-        status == "no_answer_found" for status in statuses
+    same_window_core = _same_window_core_coverage(windows, intent)
+    qa_status = _overall_qa_status(windows, intent)
+    is_index = _is_index_document(title, hit.get("path"))
+    historical, hist_penalty = is_historical_document(title, hit.get("path"))
+
+    # A source is reliable when it directly covers the requested core topic,
+    # the subject and action are bound together, and it is not a negative QA.
+    # Same-window coverage alone is not enough when a competing object has
+    # captured the action (e.g. "学生证补办" with 校园卡 only mentioned as an
+    # accessory).
+    relation_ok = (
+        subj_action >= 0.3
+        or title_action >= 0.3
+        or (same_window_core and not detect_competing_object(
+            body,
+            subject_terms=intent.subject_terms,
+            action_terms=intent.action_expanded,
+        ))
     )
-
-    # Base rule: full coverage, real content, not a directory page.
-    reliable = coverage >= 1.0 and not is_index
-
-    # QA status overrides: a clearly resolved window is good;
-    # a window that only says "no_answer_found" is not evidence.
-    if all_no_answer:
-        reliable = False
-    elif has_resolved and same_window_full:
-        reliable = True
-    elif same_window_full or exact_phrase_match or title_all_terms:
-        reliable = True
-    else:
-        reliable = False
+    reliable = (
+        not is_index
+        and core_coverage >= 1.0
+        and qa_status is not QaEvidenceStatus.NO_ANSWER
+        and relation_ok
+    )
 
     diagnostics = {
-        "coverage": coverage,
-        "same_window_full_coverage": same_window_full,
-        "exact_phrase_match": exact_phrase_match,
-        "title_all_terms": title_all_terms,
-        "title_any_term": title_any_term,
+        "core_coverage": core_coverage,
+        "subject_action_score": subj_action,
+        "title_action_score": title_action,
+        "same_window_core_coverage": same_window_core,
+        "qa_status": qa_status.value,
         "is_index_document": is_index,
-        "has_resolved": has_resolved,
-        "all_no_answer_found": all_no_answer,
+        "is_historical": historical,
+        "historical_penalty": hist_penalty,
     }
     return reliable, diagnostics
 
 
+# Scoring weights.  Subject-action binding is the strongest signal.
+CORE_COVERAGE_WEIGHT = 3.0
+SUBJECT_ACTION_WEIGHT = 4.0
+SAME_WINDOW_BONUS = 1.0
+EXACT_PHRASE_BONUS = 1.5
+HEADING_BONUS = 1.0
+TITLE_TARGET_BONUS = 0.8
+MODIFIER_WEIGHT = 0.25
+WINDOW_BONUS = 0.1
+COMPETING_OBJECT_PENALTY = 1.5
+INDEX_PENALTY = 0.8
+PARTIAL_CORE_PENALTY = 0.8
+HISTORICAL_PENALTY = 0.4
+
+
 def score_grep_hit(hit: dict, query_terms: list[str]) -> float:
-    """Rank grep hits so direct answers outrank partial or index matches."""
-    terms = [_normalize(t) for t in query_terms if t]
-    if not terms:
+    """Rank grep hits so direct answers outrank partial or relationally wrong matches."""
+    intent = parse_query_terms(query_terms)
+    if not intent.core_terms:
         return 0.0
 
-    matched = {_normalize(t) for t in hit.get("matched_keywords", [])}
-    coverage = len(matched) / len(terms)
     windows = _window_texts(hit)
-    same_window_full = any(
-        all(term in _normalize(window) for term in terms) for window in windows
+    body = _combine_grep_snippets(hit)
+    body_norm = _normalize(body)
+    title = hit.get("title", "")
+
+    core_coverage = _core_coverage(body_norm, intent)
+    subj_action = subject_action_relevance(
+        body, subject_terms=intent.subject_terms, action_terms=intent.action_expanded
     )
-    phrase = " ".join(query_terms)
-    exact_phrase_match = any(phrase in window for window in windows)
+    title_action = subject_action_relevance(
+        title, subject_terms=intent.subject_terms, action_terms=intent.action_expanded
+    )
+    same_window_core = _same_window_core_coverage(windows, intent)
+    exact_phrase, target_phrase = _relation_flags(body, intent)
+    title_exact, title_target = _relation_flags(title, intent)
+    modifier_coverage = _modifier_coverage(body_norm, intent)
 
-    title = _normalize(hit.get("title", ""))
-    title_all_terms = all(term in title for term in terms)
-    title_any_term = any(term in title for term in terms)
-    is_index = _is_index_document(hit.get("title", ""))
+    relevant_windows = sum(
+        1
+        for w in windows
+        if any(_normalize(t) in _normalize(w) for t in intent.core_terms)
+    )
 
-    score = coverage
-    if same_window_full:
-        score += 0.8
-    if exact_phrase_match:
-        score += 0.5
-    if title_all_terms:
-        score += 0.4
-    elif title_any_term:
-        score += 0.15
-    score += min(len(windows), 3) * 0.05
-    if coverage < 1.0:
-        score -= 0.4
+    competing = detect_competing_object(
+        body, subject_terms=intent.subject_terms, action_terms=intent.action_expanded
+    ) or detect_competing_object(
+        title, subject_terms=intent.subject_terms, action_terms=intent.action_expanded
+    )
+
+    is_index = _is_index_document(title, hit.get("path"))
+    historical, _ = is_historical_document(title, hit.get("path"))
+
+    score = 0.0
+    score += core_coverage * CORE_COVERAGE_WEIGHT
+    score += subj_action * SUBJECT_ACTION_WEIGHT
+    score += title_action * (SUBJECT_ACTION_WEIGHT * 0.35)
+
+    if exact_phrase:
+        score += EXACT_PHRASE_BONUS
+    if title_exact:
+        score += HEADING_BONUS
+    if same_window_core:
+        score += SAME_WINDOW_BONUS
+    if title_target and not title_exact:
+        score += TITLE_TARGET_BONUS
+
+    score += modifier_coverage * MODIFIER_WEIGHT
+    score += min(relevant_windows, 3) * WINDOW_BONUS
+
+    if competing:
+        score -= COMPETING_OBJECT_PENALTY
     if is_index:
-        score -= 0.5
-    if coverage <= 1.0 / len(terms) and len(terms) > 1:
-        # Penalize hits that only mention one term among several.
+        score -= INDEX_PENALTY
+    if core_coverage < 1.0:
+        score -= PARTIAL_CORE_PENALTY
+    if historical:
+        score -= HISTORICAL_PENALTY
+
+    # Tiny extra penalty for single-keyword saturation so that documents
+    # mentioning only one core term do not float up.
+    if len(intent.core_terms) > 1 and core_coverage <= 1.0 / len(intent.core_terms):
         score -= 0.3
+
     return max(0.0, score)
 
 
@@ -251,20 +703,24 @@ def grep_hits_to_search_results(
 def select_grounding_sources(
     sources: list[SearchResult], *, max_sources: int = 7
 ) -> list[SearchResult]:
-    """Choose the best sources for the second-stage grounded prompt.
+    """Choose the best reliable sources for the grounded prompt.
 
-    Reliable sources come first, then the highest-scoring unreliable sources.
+    Unreliable sources are never promoted into the grounded set just to fill
+    the cap.
     """
-    reliable = sorted(
-        (s for s in sources if s.reliable), key=lambda s: s.score, reverse=True
-    )
-    unreliable = sorted(
-        (s for s in sources if not s.reliable), key=lambda s: s.score, reverse=True
-    )
-    selected = reliable[:max_sources]
-    if len(selected) < max_sources:
-        selected.extend(unreliable[: max_sources - len(selected)])
-    return selected
+    seen: set[str] = set()
+    reliable: list[SearchResult] = []
+    for source in sources:
+        if not source.reliable:
+            continue
+        key = source.document.yuque_id or source.document.url or source.document.title
+        if key in seen:
+            continue
+        seen.add(key)
+        reliable.append(source)
+
+    reliable.sort(key=lambda s: s.score, reverse=True)
+    return reliable[:max_sources]
 
 
 def merge_search_results(a: SearchResult, b: SearchResult) -> SearchResult:

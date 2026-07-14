@@ -13,10 +13,27 @@ from ..doc_utils import (
     read_document_lines,
 )
 from ..evidence import (
+    _ACTION_SYNONYMS,
+    _canonical_action,
     document_from_index_row,
     evaluate_grep_reliability,
     score_grep_hit,
 )
+
+
+def _expand_query_term(term: str) -> list[str]:
+    """Return the term plus known action synonyms.
+
+    If ``term`` is an action (or one of its synonyms), the whole synonym set is
+    included so that "补办" also matches "补卡" / "重办".
+    """
+    canonical = _canonical_action(term)
+    if canonical is None:
+        return [term]
+    expanded = list(_ACTION_SYNONYMS[canonical])
+    if term not in expanded:
+        expanded.append(term)
+    return expanded
 
 
 @dataclass
@@ -84,14 +101,20 @@ class GrepLocalDocsTool(_Tool):
             reliable_count = sum(
                 1 for h in hits if evaluate_grep_reliability(h, terms)[0]
             )
+            tracked_before = len(self.tracker.sources)
+            self.tracker.add_grep_hits(hits, terms)
+            tracked_after = len(self.tracker.sources)
             logger.info(
-                "NJU grep evidence: query=%r hits=%d reliable=%d tracked=%d",
+                "NJU grep evidence: query=%r hits=%d reliable=%d "
+                "tracked_before=%d tracked_after=%d added=%d merged=%d",
                 keywords,
                 len(hits),
                 reliable_count,
-                len(self.tracker.sources),
+                tracked_before,
+                tracked_after,
+                tracked_after - tracked_before,
+                len(hits) - (tracked_after - tracked_before),
             )
-            self.tracker.add_grep_hits(hits, terms)
         return {"count": len(hits), "results": hits}
 
     def _search(
@@ -103,6 +126,10 @@ class GrepLocalDocsTool(_Tool):
     ) -> list[dict]:
         if not terms:
             return []
+
+        # Expand action terms with known synonyms so "补办" also matches "补卡".
+        term_expansions = {term: _expand_query_term(term) for term in terms}
+
         hits: list[dict] = []
         cf = context_lines
         for row in self.index.all_documents():
@@ -123,11 +150,14 @@ class GrepLocalDocsTool(_Tool):
 
             matched_indices: set[int] = set()
             matched_terms: set[str] = set()
-            lower_terms = [t.casefold() for t in terms]
+            expansion_lower = {
+                term: [t.casefold() for t in expansions]
+                for term, expansions in term_expansions.items()
+            }
             for i, line in enumerate(lines):
                 line_lower = line.casefold()
-                for term, term_lower in zip(terms, lower_terms):
-                    if term_lower in line_lower:
+                for term, term_lowers in expansion_lower.items():
+                    if any(tl in line_lower for tl in term_lowers):
                         matched_indices.add(i)
                         matched_terms.add(term)
             if not matched_indices:
