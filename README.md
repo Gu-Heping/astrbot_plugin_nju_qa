@@ -43,6 +43,7 @@ namespace 是语雀文档 URL `https://www.yuque.com/<namespace>/<slug>` 中的 
 | `table_font_path` | 否 | 表格图片使用的字体文件绝对路径；留空则自动搜索系统字体。 |
 | `auto_download_table_font` | 否 | 未找到系统字体时自动下载开源中文字体（Noto Sans CJK SC，约 8 MB），默认 `true`；优先使用 jsDelivr 镜像，失败再尝试 Gitee/GitHub。 |
 | `table_font_download_timeout` | 否 | 字体下载超时（秒），默认 `30`，范围 `5~300`。 |
+| `retrieval_diagnostics` | 否 | 默认 `false`；设为 `true` 时 Agent 会在日志中打印研究阶段的工具调用、候选文档、读取行号、Evidence ID 与引用数量，用于排查检索问题。不打印完整正文。 |
 
 首次使用：配置完成后执行 `/nju_sync`，待完成后使用 `/nju_sync status`。同步会自动切分文档并建立可选的向量索引。
 

@@ -133,12 +133,20 @@ def _install_astrbot_shim() -> None:
     core.agent = agent
     run_context = _make_module("astrbot.core.agent.run_context")
     agent.run_context = run_context
+    tool_mod = _make_module("astrbot.core.agent.tool")
+    agent.tool = tool_mod
 
     class ContextWrapper:
         def __init__(self, *args, **kwargs) -> None:
             pass
 
     run_context.ContextWrapper = ContextWrapper
+
+    class ToolSet:
+        def __init__(self, tools=None):
+            self.tools = list(tools) if tools is not None else []
+
+    tool_mod.ToolSet = ToolSet
 
     # core.astr_agent_context stub used by nju_qa.tools.
     astr_agent_context = _make_module("astrbot.core.astr_agent_context")

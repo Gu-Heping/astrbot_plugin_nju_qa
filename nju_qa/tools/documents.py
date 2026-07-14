@@ -260,6 +260,17 @@ class GrepLocalDocsTool(_Tool):
                 after,
                 after - before,
             )
+            if getattr(self.tracker, "diagnostics", False):
+                for i, hit in enumerate(hits[:10], 1):
+                    logger.info(
+                        "NJU grep candidate %d: title=%s path=%s score=%s "
+                        "matched=%s",
+                        i,
+                        hit.get("title"),
+                        hit.get("path"),
+                        hit.get("score"),
+                        hit.get("matched_keywords"),
+                    )
 
         # Surface a recommended line range so the model can read efficiently.
         for hit in hits:
@@ -434,6 +445,16 @@ class ReadDocTool(_Tool):
             return {"error": str(exc), "file_path": file_path}
         if self.tracker:
             resolved_path = result.get("file_path", file_path)
+            line_start = result.get("start_line")
+            line_end = result.get("end_line")
+            if getattr(self.tracker, "diagnostics", False):
+                logger.info(
+                    "NJU read_doc: file=%s lines=%s:%s chars=%d",
+                    resolved_path,
+                    line_start,
+                    line_end,
+                    len(result.get("content", "")),
+                )
             row = next(
                 (
                     r
@@ -444,7 +465,12 @@ class ReadDocTool(_Tool):
             )
             if row is not None:
                 document = document_from_index_row(row, result["content"])
-                self.tracker.add_read_document(document, result["content"])
+                self.tracker.add_read_document(
+                    document,
+                    result["content"],
+                    line_start=line_start,
+                    line_end=line_end,
+                )
             else:
                 self.tracker.add_evidence(
                     evidence_excerpt_from_text(

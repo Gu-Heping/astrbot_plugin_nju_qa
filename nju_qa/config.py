@@ -30,6 +30,7 @@ class PluginConfig:
     table_font_path: str = ""
     auto_download_table_font: bool = True
     table_font_download_timeout: int = 30
+    retrieval_diagnostics: bool = False
 
     @classmethod
     def from_mapping(cls, raw: Any) -> "PluginConfig":
@@ -68,6 +69,7 @@ class PluginConfig:
         table_font_path = str(raw.get("table_font_path", ""))
         auto_download_table_font = bool(raw.get("auto_download_table_font", True))
         table_font_download_timeout = int(raw.get("table_font_download_timeout", 30))
+        retrieval_diagnostics = bool(raw.get("retrieval_diagnostics", False))
         if not 1 <= top_k <= 20 or not 0 <= threshold <= 1:
             raise ValueError("检索配置超出允许范围")
         if not 200 <= chunk_size <= 8000 or not 0 <= chunk_overlap < chunk_size // 2:
@@ -101,4 +103,5 @@ class PluginConfig:
             table_font_path,
             auto_download_table_font,
             table_font_download_timeout,
+            retrieval_diagnostics,
         )

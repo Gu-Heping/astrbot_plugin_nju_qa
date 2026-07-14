@@ -446,8 +446,11 @@ def test_agent_answer_uses_only_read_evidence_and_strips_markers():
 
     async def loop(**kwargs):
         tools = kwargs["tools"]
-        read = next(t for t in tools if t.name == "read_doc")
-        await read._run(file_path="card.md")
+        system_prompt = kwargs.get("system_prompt", "")
+        if "研究" in system_prompt:
+            read = next(t for t in tools if t.name == "read_doc")
+            await read._run(file_path="card.md")
+            return _Response("research done")
         return _Response("校园卡可在信息化建设管理服务中心补办 [E1]。")
 
     agent = NjuQaAgent(_Context(), tool_factory, loop, docs_root=tmp_path)
@@ -474,8 +477,11 @@ def test_agent_strips_fake_url_and_keeps_verified_url():
 
     async def loop(**kwargs):
         tools = kwargs["tools"]
-        read = next(t for t in tools if t.name == "read_doc")
-        await read._run(file_path="card.md")
+        system_prompt = kwargs.get("system_prompt", "")
+        if "研究" in system_prompt:
+            read = next(t for t in tools if t.name == "read_doc")
+            await read._run(file_path="card.md")
+            return _Response("research done")
         return _Response("校园卡可在中心补办 [E1]，详情见 https://fake.test。")
 
     agent = NjuQaAgent(_Context(), tool_factory, loop, docs_root=tmp_path)

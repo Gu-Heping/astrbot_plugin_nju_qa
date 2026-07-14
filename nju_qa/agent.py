@@ -47,22 +47,27 @@ _MAX_ANSWER_STEPS = 3
 _NO_EVIDENCE_MARKERS = ("知识库中暂未找到可靠资料", "知识库中暂未找到可靠答案")
 
 _SMALL_TALK_PATTERNS: list[re.Pattern] = [
-    re.compile(r"^(你好|您好|嗨|哈喽|hello|hi|hey|在吗|在不在|早上好|下午好|晚上好)([！!。，,\s]|$)", re.IGNORECASE),
-    re.compile(r"^(谢谢|多谢|感谢|拜拜|再见|bye|goodbye)([！!。，,\s]|$)", re.IGNORECASE),
+    re.compile(r"^(你好|您好|嗨|哈喽|hello|hi|hey|在吗|在不在|早上好|下午好|晚上好)([！!。，,？?\s]|$)", re.IGNORECASE),
+    re.compile(r"^(谢谢|多谢|感谢|拜拜|再见|bye|goodbye)([！!。，,？?\s]|$)", re.IGNORECASE),
     re.compile(r"^(你?是谁|你叫什么|你叫什么名字|介绍一下你|自我介绍一下)"),
     re.compile(r"^(你?能做什么|你?会什么|你?有什么功能|帮助|help|怎么用)"),
-    re.compile(r"^(好的|行|可以|ok|okay|知道了|明白)([！!。，,\s]|$)", re.IGNORECASE),
+    re.compile(r"^(好的|行|可以|ok|okay|知道了|明白)([！!。，,？?\s]|$)", re.IGNORECASE),
 ]
 
 
 def _is_small_talk(prompt: str) -> bool:
-    """Return True only for a small set of pure conversational openers."""
-    text = prompt.strip().casefold()
+    """Return True only when the whole message is a pure conversational opener."""
+    text = prompt.strip()
     if not text:
         return True
     for pattern in _SMALL_TALK_PATTERNS:
-        if pattern.search(text):
-            return True
+        match = pattern.search(text)
+        if match:
+            # Anything beyond the greeting (except trailing punctuation/space)
+            # means the message also contains a factual question.
+            tail = text[match.end():].strip(" \t\n\r！!。，,、；：:？?\"'")
+            if not tail:
+                return True
     return False
 
 
@@ -111,6 +116,7 @@ class SourceTracker:
     selected_excerpts: list[EvidenceExcerpt] = field(default_factory=list)
     read_sources: set[str] = field(default_factory=set)
     verified_urls: set[str] = field(default_factory=set)
+    diagnostics: bool = False
 
     def reset(self) -> None:
         self.candidate_sources.clear()
@@ -154,13 +160,24 @@ class SourceTracker:
 
         self.add_candidates(grep_hits_to_search_results(hits, query_terms))
 
-    def add_read_document(self, document, content: str) -> None:
+    def add_read_document(
+        self,
+        document,
+        content: str,
+        line_start: int | None = None,
+        line_end: int | None = None,
+    ) -> None:
         """Record a document read as concrete evidence."""
         key = str(document.path or document.yuque_id)
         self.read_sources.add(key)
         self.record_urls(content)
         self.add_evidence(
-            evidence_excerpt_from_read(document, content[:2400])
+            evidence_excerpt_from_read(
+                document,
+                content[:2400],
+                line_start=line_start,
+                line_end=line_end,
+            )
         )
 
     def add_evidence(self, excerpt: EvidenceExcerpt) -> EvidenceExcerpt:
@@ -233,14 +250,11 @@ class NjuQaAgent:
             return await self._answer_small_talk(event, prompt)
 
         tracker = SourceTracker()
+        tracker.diagnostics = self.diagnostics
         await self._research_phase(event, prompt, tracker)
 
         if not tracker.evidence_excerpts:
             logger.info("NJU agent: no evidence excerpts after research")
-            return NO_EVIDENCE
-
-        if tracker.has_negative_evidence(prompt):
-            logger.info("NJU agent: high-confidence negative evidence found")
             return NO_EVIDENCE
 
         self._log_evidence_summary(tracker)
@@ -271,6 +285,12 @@ class NjuQaAgent:
         provider_id = await self.context.get_current_chat_provider_id(
             getattr(event, "unified_msg_origin")
         )
+        if self.diagnostics:
+            logger.info(
+                "NJU agent research start: prompt=%r tools=%s",
+                prompt,
+                [getattr(t, "name", "") for t in self.tools(tracker)],
+            )
         try:
             response = await self._run_tool_loop(
                 event=event,
@@ -311,6 +331,7 @@ class NjuQaAgent:
         provider_id = await self.context.get_current_chat_provider_id(
             getattr(event, "unified_msg_origin")
         )
+        self._log_evidence_summary(tracker)
         excerpts = self._select_excerpts(tracker)
         tracker.selected_excerpts = excerpts
 
@@ -320,6 +341,14 @@ class NjuQaAgent:
 
         grounded_prompt = self._build_answer_prompt(prompt, excerpts)
         answer_tools = self._answer_tools(tracker)
+
+        if self.diagnostics:
+            logger.info(
+                "NJU agent answer start: selected=%d ids=%s tools=%s",
+                len(excerpts),
+                [e.evidence_id for e in excerpts],
+                [getattr(t, "name", "") for t in answer_tools],
+            )
 
         for attempt in range(2):
             try:
@@ -357,7 +386,11 @@ class NjuQaAgent:
         self, question: str, excerpts: list[EvidenceExcerpt]
     ) -> str:
         parts = [f"请回答原问题：{question}\n"]
-        parts.append("你只能使用下面标记的证据回答问题。")
+        parts.append(
+            "你只能使用下面标记的证据回答问题。"
+            "若某条证据明确标记 no_answer，只能说明该事项暂无可靠资料，"
+            "不能用其他相邻材料推断；但不得因此忽略其他已有正面证据的问题部分。"
+        )
         for excerpt in excerpts:
             loc = ""
             if excerpt.line_start is not None:
@@ -366,6 +399,8 @@ class NjuQaAgent:
             note = ""
             if excerpt.historical:
                 note = "（历史资料）"
+            if excerpt.qa_status == "no_answer":
+                note += "（该证据明确说明暂无可靠资料）"
             header = (
                 f"[{excerpt.evidence_id}]\n"
                 f"来源：《{excerpt.title}》{loc}{note}\n"
@@ -376,15 +411,12 @@ class NjuQaAgent:
         return "\n\n".join(parts)
 
     def _answer_tools(self, tracker: SourceTracker) -> list[object]:
-        """Return a minimal tool set for the answer phase.
+        """Return an empty tool set for the answer phase.
 
-        The answer model should not search.  We only expose read_doc so it can
-        fetch a bit more context from an already-open document if absolutely
-        necessary.  Any new read is recorded as additional evidence.
+        The answer model must only use the evidence selected during research.
+        Opening more tools here would allow new evidence that cannot be cited.
         """
-        all_tools = self.tools(tracker)
-        allowed = {"read_doc"}
-        return [t for t in all_tools if getattr(t, "name", "") in allowed]
+        return []
 
     def _finalize_answer(
         self,
@@ -422,6 +454,13 @@ class NjuQaAgent:
             len(used),
             len(citations),
         )
+        if self.diagnostics:
+            logger.info(
+                "NJU agent final: available_ids=%s used_ids=%s citation_count=%d",
+                [e.evidence_id for e in excerpts],
+                used_ids,
+                len(citations),
+            )
         if not citations:
             return visible
         return f"{visible}\n\n参考来源：\n" + "\n".join(citations)
@@ -444,6 +483,14 @@ class NjuQaAgent:
                     len(tracker.candidate_sources),
                     len(tracker.evidence_excerpts),
                     tracker.read_count)
+        for i, cand in enumerate(tracker.candidate_sources[:20], 1):
+            logger.info(
+                "NJU candidate %d: title=%s path=%s score=%s",
+                i,
+                getattr(cand.document, "title", "?"),
+                getattr(cand.document, "path", "?"),
+                cand.score,
+            )
         for e in tracker.evidence_excerpts:
             logger.info(
                 "NJU evidence excerpt: id=%s type=%s doc=%s lines=%s:%s chars=%d qa=%s historical=%s",
@@ -463,9 +510,10 @@ class NjuQaAgent:
         # Allow callers to override the tool set (e.g. answer phase).
         if "tools" not in kwargs:
             kwargs["tools"] = self.tools(tracker)
+        max_steps = int(kwargs.pop("max_steps", 12))
 
         if self._tool_loop is not None:
-            return await self._tool_loop(**kwargs)
+            return await self._tool_loop(max_steps=max_steps, **kwargs)
 
         from astrbot.core.agent.tool import ToolSet
 
@@ -473,7 +521,10 @@ class NjuQaAgent:
         # passed to the tools factory above.
         kwargs.pop("tracker", None)
         return await self.context.tool_loop_agent(
-            tools=ToolSet(kwargs.pop("tools")), max_steps=12, tool_call_timeout=60, **kwargs
+            tools=ToolSet(kwargs.pop("tools")),
+            max_steps=max_steps,
+            tool_call_timeout=60,
+            **kwargs,
         )
 
     def _read_source_body(self, source: SearchResult, limit: int = 8000) -> str:

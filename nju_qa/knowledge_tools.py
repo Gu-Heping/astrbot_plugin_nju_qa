@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from astrbot.api import logger
+
 from .agent import SourceTracker
 from .doc_utils import clean_document_body
 from .models import ChunkResult
@@ -29,6 +31,17 @@ async def search_knowledge_base(
     # Search/grep hits are candidates only; the model must read the actual
     # document to turn them into grounded evidence.
     tracker.add_candidates(results)
+    if getattr(tracker, "diagnostics", False):
+        logger.info("NJU search_knowledge_base: query=%r results=%d", query, len(results))
+        for i, r in enumerate(results[:10], 1):
+            logger.info(
+                "NJU search candidate %d: title=%s path=%s score=%s reliable=%s",
+                i,
+                r.document.title,
+                r.document.path,
+                r.score,
+                r.reliable,
+            )
     return {
         "reliable": all(r.reliable for r in results),
         "candidates": [_result_to_dict(r.chunk, r) for r in results],

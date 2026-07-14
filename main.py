@@ -136,6 +136,7 @@ class NjuQaPlugin(Star):
             ],
             docs_root=self.store.root,
             index=self.index,
+            diagnostics=self.config.retrieval_diagnostics,
         )
         self.router = MessageRouter(
             self.config.wake_words,
