@@ -215,6 +215,7 @@ def _merge_excerpts(existing: EvidenceExcerpt, new: EvidenceExcerpt) -> Evidence
         existing.applicable_years,
         existing.document_year,
     )
+    existing.historical = existing.version_status in {"historical", "archived"}
     return existing
 
 
@@ -544,11 +545,29 @@ class NjuQaAgent:
                 note = "（历史资料）"
             if excerpt.qa_status == "no_answer":
                 note += "（该证据明确说明暂无可靠资料）"
+
+            version_meta: list[str] = []
+            if excerpt.version_status:
+                version_meta.append(f"版本状态：{excerpt.version_status}")
+            if excerpt.document_year is not None:
+                version_meta.append(f"文档年份：{excerpt.document_year}")
+            if excerpt.applicable_years:
+                version_meta.append(
+                    f"适用年份：{', '.join(str(y) for y in excerpt.applicable_years)}"
+                )
+            if excerpt.applicable_cohorts:
+                version_meta.append(
+                    f"适用年级：{', '.join(excerpt.applicable_cohorts)}"
+                )
+            if excerpt.historical_reason:
+                version_meta.append(f"判定原因：{excerpt.historical_reason}")
+            meta_part = ("\n".join(version_meta) + "\n") if version_meta else ""
+
             header = (
                 f"[{excerpt.evidence_id}]\n"
                 f"来源：《{excerpt.title}》{loc}{note}\n"
                 f"URL：{excerpt.url or 'n/a'}\n"
-                f"内容：\n{excerpt.content}"
+                f"{meta_part}内容：\n{excerpt.content}"
             )
             parts.append(header)
         return "\n\n".join(parts)

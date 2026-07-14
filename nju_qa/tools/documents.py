@@ -74,24 +74,25 @@ def _clamp_read_range(
     end_line: int | None,
     total_lines: int,
 ) -> tuple[int, int, list[str]]:
-    """Clamp a requested line range to the preferred window.
+    """Clamp a requested 1-based inclusive line range to the preferred window.
 
-    Returns ``(start, end, warnings)``.  Ranges above ``_MAX_READ_LINES`` are
-    narrowed; ranges above the preferred size receive a warning but are kept.
+    Returns ``(start, end, warnings)``.  Ranges above ``_MAX_READ_LINES`` lines
+    are narrowed; ranges above the preferred size receive a warning but are kept.
     """
-    start = max(0, start_line or 0)
+    start = max(1, start_line or 1)
     end = total_lines if end_line is None else min(end_line, total_lines)
     warnings: list[str] = []
-    if end - start > _MAX_READ_LINES:
-        narrowed = start + _PREFERRED_READ_LINES
+    count = end - start + 1
+    if count > _MAX_READ_LINES:
+        narrowed_end = start + _PREFERRED_READ_LINES - 1
         warnings.append(
-            f"请求读取 {start}-{end}（{end - start} 行）超过 {_MAX_READ_LINES} 行，"
-            f"已收窄到 {start}-{narrowed} 行。"
+            f"请求读取 {start}-{end}（{count} 行）超过 {_MAX_READ_LINES} 行，"
+            f"已收窄到 {start}-{narrowed_end} 行。"
         )
-        end = narrowed
-    elif end - start > _PREFERRED_READ_LINES:
+        end = narrowed_end
+    elif count > _PREFERRED_READ_LINES:
         warnings.append(
-            f"请求读取 {start}-{end}（{end - start} 行）较大，建议控制在 "
+            f"请求读取 {start}-{end}（{count} 行）较大，建议控制在 "
             f"{_MIN_READ_LINES}-{_PREFERRED_READ_LINES} 行以内。"
         )
     return start, end, warnings

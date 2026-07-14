@@ -6,7 +6,7 @@ import asyncio
 import re
 from pathlib import Path
 
-from nju_qa.agent import SourceTracker
+from nju_qa.agent import NjuQaAgent, SourceTracker
 from nju_qa.document_index import DocumentIndex
 from nju_qa.evidence import (
     EvidenceExcerpt,
@@ -139,6 +139,36 @@ def test_version_unknown_when_no_version_info():
     )
     assert status == "unknown"
 
+
+def test_answer_prompt_includes_version_metadata():
+    """Historical evidence must expose its version metadata in the grounded prompt."""
+
+    class _Ctx:
+        async def get_current_chat_provider_id(self, _umo):
+            return "provider"
+
+    agent = NjuQaAgent(_Ctx(), lambda tracker: [], None)
+    excerpt = EvidenceExcerpt(
+        evidence_id="E1",
+        title="2024级培养方案",
+        file_path="plan.md",
+        line_start=1,
+        line_end=5,
+        content="适用于 2024 级学生。",
+        historical=True,
+        version_status="historical",
+        document_year=2024,
+        applicable_years=[2024],
+        applicable_cohorts=["2024级"],
+        historical_reason="文档标题/路径包含年份 2024",
+    )
+    prompt = agent._build_answer_prompt("大一学什么？", [excerpt])
+    assert "版本状态：historical" in prompt
+    assert "文档年份：2024" in prompt
+    assert "适用年份：2024" in prompt
+    assert "适用年级：2024级" in prompt
+    assert "判定原因：" in prompt
+    assert "（历史资料）" in prompt
 
 
 # ---------------------------------------------------------------------------
@@ -389,18 +419,22 @@ def test_summaries_exclude_top_level_index_categories():
 
 
 def test_clamp_read_range():
+    # 1-based inclusive ranges.
+    assert _clamp_read_range(1, 40, 100) == (1, 40, [])
     assert _clamp_read_range(5, 15, 100) == (5, 15, [])
-    start, end, warnings = _clamp_read_range(0, 50, 100)
-    assert (start, end) == (0, 50)
-    assert warnings and "较大" in warnings[0]
-    start, end, warnings = _clamp_read_range(0, 100, 100)
-    assert (start, end) == (0, 40)
+
+    start, end, warnings = _clamp_read_range(1, 100, 100)
+    assert (start, end) == (1, 40)
+    assert warnings and "收窄" in warnings[0]
+
+    start, end, warnings = _clamp_read_range(51, 150, 200)
+    assert (start, end) == (51, 90)
     assert warnings and "收窄" in warnings[0]
 
 
 def test_clamp_read_range_handles_none():
     start, end, warnings = _clamp_read_range(None, None, 30)
-    assert (start, end) == (0, 30)
+    assert (start, end) == (1, 30)
     assert warnings == []
 
 

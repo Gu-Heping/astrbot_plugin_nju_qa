@@ -302,6 +302,7 @@ def evidence_excerpts_from_read(
         _populate_version_metadata(
             excerpt, document.title, str(document.path or ""), block
         )
+        excerpt.historical = excerpt.version_status in {"historical", "archived"}
         excerpts.append(excerpt)
     return excerpts
 
