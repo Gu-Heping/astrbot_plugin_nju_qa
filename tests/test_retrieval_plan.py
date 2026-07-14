@@ -47,6 +47,14 @@ def test_plan_extracts_entity_terms(rows):
     assert plan[0].scope_namespace == "QA"
 
 
+def test_plan_extracts_unknown_entities(rows):
+    plan = build_retrieval_plan("星际学院怎么进", rows)
+    assert len(plan) == 1
+    assert "星际学院" in plan[0].entity_terms
+    # Unknown entities still get a scoped search when possible.
+    assert plan[0].scope_namespace == ""
+
+
 def test_plan_splits_subquestions(rows):
     plan = build_retrieval_plan("校园卡在哪补办？选课系统怎么进？", rows)
     assert len(plan) == 2
@@ -97,6 +105,51 @@ def test_classify_direct_requires_entity_in_source(rows):
     assert classify_coverage(plan, []).status == CoverageStatus.UNSUPPORTED
 
 
+def test_classify_ignores_unreliable_sources(rows):
+    plan = build_retrieval_plan("开甲学院大一要学什么", rows)[0]
+    unreliable = SearchResult(
+        source_id="S1",
+        document=Document(
+            yuque_id="kaijia",
+            title="开甲学院培养方案",
+            repository="repo",
+            namespace="QA",
+            slug="kaijia",
+            url="",
+            created_at="a",
+            updated_at="b",
+            body="开甲学院大一学习数学、程序设计。",
+            path=Path("QA/02_教务与学业/培养方案/开甲学院.md"),
+        ),
+        score=1.0,
+        reliable=False,
+    )
+    assert classify_coverage(plan, [unreliable]).status == CoverageStatus.UNSUPPORTED
+
+
+def test_classify_direct_requires_same_window(rows):
+    plan = build_retrieval_plan("开甲学院大一要学什么", rows)[0]
+    # Entity and core condition appear in different windows.
+    source = SearchResult(
+        source_id="S1",
+        document=Document(
+            yuque_id="split",
+            title="分散文档",
+            repository="repo",
+            namespace="QA",
+            slug="split",
+            url="",
+            created_at="a",
+            updated_at="b",
+            body="开甲学院简介。\n\n大一学生都要学习数学。",
+            path=Path("QA/split.md"),
+        ),
+        score=1.0,
+        reliable=True,
+    )
+    assert classify_coverage(plan, [source]).status == CoverageStatus.BACKGROUND
+
+
 def test_check_coverage_flags_entity_specific_unsupported(rows):
     plan = build_retrieval_plan("开甲学院大一要学什么", rows)
     generic_source = SearchResult(
@@ -140,3 +193,25 @@ def test_generic_question_direct_without_entity(rows):
         reliable=True,
     )
     assert classify_coverage(plan, [source]).status == CoverageStatus.DIRECT
+
+
+def test_no_answer_window_prevents_direct(rows):
+    plan = build_retrieval_plan("校园卡过期是什么意思", rows)
+    source = SearchResult(
+        source_id="S1",
+        document=Document(
+            yuque_id="faq",
+            title="常见疑问汇总",
+            repository="repo",
+            namespace="QA",
+            slug="faq",
+            url="",
+            created_at="a",
+            updated_at="b",
+            body="校园卡过期暂无可靠答案，待补充。",
+            path=Path("QA/faq.md"),
+        ),
+        score=1.0,
+        reliable=True,
+    )
+    assert classify_coverage(plan, [source]).status == CoverageStatus.UNSUPPORTED

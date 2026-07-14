@@ -177,3 +177,24 @@ async def test_grep_excludes_archived_when_configured(sample_index):
     )
     assert result_all["count"] == 1
     assert result_live["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_list_repo_docs_default_limit_is_20(sample_index):
+    index, tmp_path = sample_index
+    tool = ListRepoDocsTool(index=index, docs_root=tmp_path)
+    result = await tool._run(namespace="QA")
+    assert len(result["documents"]) <= 20
+    assert result["count"] <= 20
+
+
+@pytest.mark.asyncio
+async def test_list_repo_docs_pagination(sample_index):
+    index, tmp_path = sample_index
+    tool = ListRepoDocsTool(index=index, docs_root=tmp_path)
+    first = await tool._run(namespace="QA", limit=2, offset=0)
+    assert len(first["documents"]) == 2
+    assert first["has_more"] is True
+    second = await tool._run(namespace="QA", limit=2, offset=2)
+    assert len(second["documents"]) == 2
+    assert first["documents"][0]["path"] != second["documents"][0]["path"]

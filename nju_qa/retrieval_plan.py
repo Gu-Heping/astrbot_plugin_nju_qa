@@ -1,10 +1,12 @@
 """Retrieval planning and evidence coverage classification.
 
-The planner splits a user question into sub-questions/entities, scopes each one
-to the knowledge-base structure, and decides which tool is most appropriate.
+The planner splits a user question into sub-questions, extracts campus entities
+from the query itself (unknown entities are kept so the retrieval layer can
+search for them), and scopes each sub-question to the knowledge-base structure.
+
 After retrieval, coverage classification ensures that entity-specific questions
-are only answered with DIRECT evidence (the entity is mentioned in a matched
-source), not with generic campus background material.
+are only answered with DIRECT evidence: a *reliable* source whose supporting
+window contains both the entity and the core question condition.
 """
 
 from __future__ import annotations
@@ -15,6 +17,12 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from .entities import (
+    EntityMention,
+    extract_entities,
+    resolve_entities,
+)
+from .evidence import _ACTION_SYNONYMS, _NO_ANSWER_MARKERS
 from .keyword_index import _extract_query_terms
 from .knowledge_structure import _normalize_path, _path_segments
 
@@ -66,13 +74,76 @@ _GENERIC_CAMPUS_WORDS = frozenset(
 )
 
 _INTERROGATIVE_WORDS = frozenset(
-    "什么 怎么 哪里 哪儿 多少 何时 几时 何地 为什么 吗 呢 吧".split()
+    "什么 怎么 哪里 在哪儿 在哪 哪儿 多少 何时 几时 何地 为什么 吗 呢 吧 "
+    "如何 怎样 怎么办".split()
+)
+
+_ACTION_WORDS: frozenset[str] = frozenset(
+    {a for terms in _ACTION_SYNONYMS.values() for a in terms}
+    | set(_ACTION_SYNONYMS.keys())
+)
+
+
+def _find_spans(query: str, words: set[str]) -> list[tuple[int, int]]:
+    """Return non-overlapping (start, end) spans of ``words`` in ``query``."""
+    spans: list[tuple[int, int]] = []
+    for word in sorted({w for w in words if w}, key=len, reverse=True):
+        for match in re.finditer(re.escape(word), query):
+            spans.append((match.start(), match.end()))
+    if not spans:
+        return []
+    spans.sort()
+    merged = [spans[0]]
+    for start, end in spans[1:]:
+        prev_start, prev_end = merged[-1]
+        if start < prev_end:
+            merged[-1] = (prev_start, max(prev_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _protected_spans(query: str, entity_terms: list[str]) -> list[tuple[int, int]]:
+    """Spans of generic, interrogative, action and entity words in ``query``."""
+    words = set(_GENERIC_CAMPUS_WORDS | _INTERROGATIVE_WORDS | _ACTION_WORDS)
+    words.update(entity_terms)
+    return _find_spans(query, words)
+
+
+def _is_cross_boundary(
+    query: str, term: str, spans: list[tuple[int, int]]
+) -> bool:
+    """Return True when ``term`` straddles or is fully inside a protected span.
+
+    Terms that exactly match a protected span are allowed; they are filtered
+    elsewhere (generic/interrogative words are removed, action words are kept).
+    """
+    if not spans:
+        return False
+    for match in re.finditer(re.escape(term), query):
+        start, end = match.start(), match.end()
+        for span_start, span_end in spans:
+            if start == span_start and end == span_end:
+                continue
+            if start < span_end and end > span_start:
+                return True
+    return False
+
+
+def _normalize_marker(text: str) -> str:
+    return text.casefold()
+    return text.casefold()
+
+
+_NO_ANSWER_RE = re.compile(
+    "|".join(re.escape(_normalize_marker(m)) for m in _NO_ANSWER_MARKERS),
+    re.IGNORECASE,
 )
 
 
 def _split_subquestions(query: str) -> list[str]:
     """Split a query into sub-questions at punctuation and conjunctions."""
-    parts = re.split(r"[，。；；？?；；]|\s+(?:和|与|及|以及|还是|或者)\s+", query)
+    parts = re.split(r"[，。；；？?；；]\s*|\s+(?:和|与|及|以及|还是|或者)\s+", query)
     cleaned = [p.strip() for p in parts if p.strip()]
     return cleaned or [query.strip()]
 
@@ -124,18 +195,38 @@ def _find_matching_path_prefix(
     return "", ""
 
 
-def _core_terms(query: str) -> list[str]:
-    """Return the query with generic and interrogative words stripped out."""
-    removable = sorted(
-        _GENERIC_CAMPUS_WORDS | _INTERROGATIVE_WORDS,
-        key=len,
-        reverse=True,
-    )
-    cleaned = query
-    for word in removable:
-        cleaned = cleaned.replace(word, " ")
-    terms = [t.strip() for t in cleaned.split() if len(t.strip()) >= 2]
-    return terms
+def _is_generic_or_interrogative(term: str) -> bool:
+    """Return True when a term is part of a generic campus or interrogative word."""
+    low = term.casefold()
+    for generic in _GENERIC_CAMPUS_WORDS | _INTERROGATIVE_WORDS:
+        if low in generic.casefold() or generic.casefold() in low:
+            return True
+    return False
+
+
+def _core_terms(query: str, entity_terms: list[str] | None = None) -> list[str]:
+    """Return core question terms with generic, interrogative and entity words removed."""
+    spans = _protected_spans(query, entity_terms or [])
+    terms = [
+        term
+        for term in _extract_terms(query)
+        if len(term) >= 2
+        and not _is_generic_or_interrogative(term)
+        and not (entity_terms and any(term in e or e in term for e in entity_terms))
+        and not _is_cross_boundary(query, term, spans)
+    ]
+    return list(dict.fromkeys(terms))
+
+
+def _entity_texts(mentions: list[EntityMention]) -> list[str]:
+    """Return unique entity mention texts in query order."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for m in mentions:
+        if m.text not in seen:
+            seen.add(m.text)
+            result.append(m.text)
+    return result
 
 
 def build_retrieval_plan(query: str, rows: list[Any]) -> list[RetrievalNeed]:
@@ -150,27 +241,20 @@ def build_retrieval_plan(query: str, rows: list[Any]) -> list[RetrievalNeed]:
 
     Returns
     -------
-    A list of :class:`RetrievalNeed`.  If the query cannot be split, a single
-    need covering the whole query is returned.
+    A list of :class:`RetrievalNeed`.  Entity mentions are extracted from the
+    query itself; unknown entities are kept and searched for, not silently dropped.
     """
     candidates = _collect_entity_candidates(rows)
+    mentions = resolve_entities(extract_entities(query), rows)
     subquestions = _split_subquestions(query)
     plan: list[RetrievalNeed] = []
 
     for sub in subquestions:
-        # Entity terms are document titles / path segments that appear verbatim
-        # in the sub-question and are not generic campus words.
-        entity_terms = [
-            cand
-            for cand in candidates
-            if cand in sub
-            and cand not in _GENERIC_CAMPUS_WORDS
-            and len(cand) >= 2
-        ]
-        # Question terms are non-generic, non-interrogative words from the
-        # sub-question.  Core terms come from stripping generic words; extracted
-        # terms catch words like "大一" that are not in the candidate set.
-        core_terms = _core_terms(sub)
+        sub_mentions = [m for m in mentions if m.text in sub]
+        entity_terms = _entity_texts(sub_mentions)
+
+        core_terms = _core_terms(sub, entity_terms)
+        spans = _protected_spans(sub, entity_terms)
         extracted_terms = [
             term
             for term in _extract_terms(sub)
@@ -178,6 +262,8 @@ def build_retrieval_plan(query: str, rows: list[Any]) -> list[RetrievalNeed]:
             and term not in _INTERROGATIVE_WORDS
             and len(term) >= 2
             and term not in core_terms
+            and term not in entity_terms
+            and not _is_cross_boundary(sub, term, spans)
         ]
         candidate_terms = [
             cand
@@ -189,7 +275,10 @@ def build_retrieval_plan(query: str, rows: list[Any]) -> list[RetrievalNeed]:
             and cand not in entity_terms
             and cand not in core_terms
         ]
-        question_terms = list(dict.fromkeys(core_terms + candidate_terms + extracted_terms))
+        question_terms = list(
+            dict.fromkeys(core_terms + candidate_terms + extracted_terms)
+        )
+
         preferred_tool = "search_knowledge_base"
         if any(trigger in sub for trigger in _GROUNDED_TRIGGERS):
             preferred_tool = "grep_local_docs"
@@ -213,52 +302,97 @@ def build_retrieval_plan(query: str, rows: list[Any]) -> list[RetrievalNeed]:
     return plan
 
 
-def _source_text(source: Any) -> str:
-    """Return a searchable text representation of a source."""
-    parts: list[str] = []
-    document = getattr(source, "document", None)
+def _source_windows(source: Any) -> list[str]:
+    """Return the supporting window(s) that can be used for coverage checks."""
+    text = ""
     chunk = getattr(source, "chunk", None)
-    if document is not None:
-        parts.append(document.title)
-        if document.path:
-            parts.append(str(document.path))
-        parts.append(document.body)
-    if chunk is not None:
-        parts.append(chunk.title)
-        parts.append(chunk.file_path or "")
-        parts.append(chunk.content_snippet)
-    return "\n".join(parts)
+    document = getattr(source, "document", None)
+    if chunk is not None and chunk.content_snippet:
+        text = chunk.content_snippet
+    elif document is not None and document.body:
+        text = document.body
+    if not text:
+        return []
+    # Grep snippets often concatenate multiple match windows with blank lines.
+    windows = [w.strip() for w in text.split("\n\n") if w.strip()]
+    return windows or [text.strip()]
 
 
-def _score_source_for_need(need: RetrievalNeed, source: Any) -> tuple[bool, bool]:
-    """Return (direct, background) flags for a source against a need."""
-    text = _source_text(source).casefold()
+def _window_has_no_answer(window: str) -> bool:
+    """Return True when a window contains an explicit no-answer marker."""
+    return bool(_NO_ANSWER_RE.search(window.casefold()))
+
+
+def _window_covers_need(window: str, need: RetrievalNeed) -> bool:
+    """Return True when a supporting window directly covers a need.
+
+    For entity-specific needs, a DIRECT window must contain all entity terms and
+    at least one core question term.  For non-entity needs, all core terms are
+    required (or any question term when no core terms remain).
+    """
+    if _window_has_no_answer(window):
+        return False
+    norm = window.casefold()
     entity_terms = [t.casefold() for t in need.entity_terms]
     core_terms = [t.casefold() for t in need.core_terms]
-    question_terms = [t.casefold() for t in need.question_terms]
 
-    if entity_terms:
-        if all(term in text for term in entity_terms):
-            return True, True
-        if question_terms and any(term in text for term in question_terms):
-            return False, True
+    if entity_terms and not all(term in norm for term in entity_terms):
+        return False
+    if core_terms:
+        if entity_terms:
+            return any(term in norm for term in core_terms)
+        return all(term in norm for term in core_terms)
+    if not entity_terms and not core_terms:
+        return any(t.casefold() in norm for t in need.question_terms)
+    return True
+
+
+def _window_is_background(window: str, need: RetrievalNeed) -> bool:
+    """Return True when a window is relevant but not directly answering the need."""
+    if _window_has_no_answer(window):
+        return False
+    if _window_covers_need(window, need):
+        return False
+    norm = window.casefold()
+    terms = [t.casefold() for t in need.core_terms or need.question_terms]
+    return any(term in norm for term in terms)
+
+
+def _score_source_for_need(
+    need: RetrievalNeed, source: Any
+) -> tuple[bool, bool]:
+    """Return (direct, background) flags for a reliable source against a need."""
+    windows = _source_windows(source)
+    if not windows:
         return False, False
 
-    if core_terms and all(term in text for term in core_terms):
-        return True, True
-    if question_terms and any(term in text for term in question_terms):
-        return False, True
+    for window in windows:
+        if _window_covers_need(window, need):
+            return True, True
+
+    for window in windows:
+        if _window_is_background(window, need):
+            return False, True
 
     return False, False
 
 
 def classify_coverage(
-    need: RetrievalNeed, sources: list[Any]
+    need: RetrievalNeed,
+    sources: list[Any],
+    *,
+    require_reliable: bool = True,
 ) -> CoverageResult:
-    """Classify whether ``sources`` provide DIRECT, BACKGROUND, or no evidence."""
+    """Classify whether ``sources`` provide DIRECT, BACKGROUND, or no evidence.
+
+    By default only reliable sources are considered, because unreliable hits
+    (e.g. index documents or no-answer QA entries) must not back an answer.
+    """
     direct: list[Any] = []
     background: list[Any] = []
     for source in sources:
+        if require_reliable and not getattr(source, "reliable", False):
+            continue
         is_direct, is_background = _score_source_for_need(need, source)
         if is_direct:
             direct.append(source)
@@ -273,10 +407,16 @@ def classify_coverage(
 
 
 def check_coverage(
-    plan: list[RetrievalNeed], sources: list[Any]
+    plan: list[RetrievalNeed],
+    sources: list[Any],
+    *,
+    require_reliable: bool = True,
 ) -> list[CoverageResult]:
     """Run coverage classification for every need in a plan."""
-    return [classify_coverage(need, sources) for need in plan]
+    return [
+        classify_coverage(need, sources, require_reliable=require_reliable)
+        for need in plan
+    ]
 
 
 def format_plan(plan: list[RetrievalNeed]) -> str:
@@ -294,7 +434,22 @@ def format_plan(plan: list[RetrievalNeed]) -> str:
             f"，作用域：{scope or '全部'}{entity_note}）"
         )
     lines.append(
-        "覆盖要求：每个子问题必须获得 DIRECT 证据（证据中明确出现对应实体/关键词）"
-        "才能用于回答；只有 BACKGROUND 证据时，不能回答实体特定部分。"
+        "覆盖要求：每个子问题必须获得 DIRECT 证据（可靠来源的同一支持窗口中"
+        "同时出现对应实体和核心问题条件）才能用于回答；只有 BACKGROUND 证据时，"
+        "不能回答实体特定部分。"
     )
+    return "\n".join(lines)
+
+
+def format_coverage_report(coverage: list[CoverageResult]) -> str:
+    """Human-readable summary of coverage for prompts or diagnostics."""
+    lines = ["证据覆盖情况："]
+    for cov in coverage:
+        scope = ""
+        if cov.need.entity_terms:
+            scope = f" 实体：{', '.join(cov.need.entity_terms)}"
+        lines.append(
+            f"- {cov.need.question} → {cov.status.value}"
+            f"（支持来源 {len(cov.sources)} 个）{scope}"
+        )
     return "\n".join(lines)

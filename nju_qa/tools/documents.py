@@ -590,8 +590,8 @@ class ParseYuqueUrlTool(_Tool):
 class ListKnowledgeBasesTool(_Tool):
     name: str = "list_knowledge_bases"
     description: str = (
-        "列出已同步知识库、repository、文档数量及顶层分类统计。"
-        "保留旧的 documents 字段以兼容已有调用方。"
+        "列出已同步知识库（namespace）、repository、文档数量及顶层分类统计。"
+        "返回结果中的 top_level_categories 字段是该知识库的顶层分类列表。"
     )
     parameters: dict = field(
         default_factory=lambda: {"type": "object", "properties": {}}
@@ -623,7 +623,7 @@ class ListRepoDocsTool(_Tool):
     name: str = "list_repo_docs"
     description: str = (
         "列出指定知识库作用域下的文档、直接子分类和分页信息。"
-        "path_prefix 相对于 namespace。"
+        "path_prefix 相对于 namespace。默认返回 20 条，可通过 offset/limit 翻页。"
     )
     parameters: dict = field(
         default_factory=lambda: {
@@ -637,7 +637,7 @@ class ListRepoDocsTool(_Tool):
                 "title_query": {"type": "string"},
                 "include_archived": {"type": "boolean", "default": False},
                 "include_index": {"type": "boolean", "default": True},
-                "limit": {"type": "integer", "default": 50},
+                "limit": {"type": "integer", "default": 20},
                 "offset": {"type": "integer", "default": 0},
             },
             "required": ["namespace"],
@@ -651,7 +651,7 @@ class ListRepoDocsTool(_Tool):
         title_query: str = "",
         include_archived: bool = False,
         include_index: bool = True,
-        limit: int = 50,
+        limit: int = 20,
         offset: int = 0,
         **_,
     ) -> dict:

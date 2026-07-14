@@ -10,6 +10,7 @@ from typing import Any
 from astrbot.api import logger
 
 from .doc_utils import read_document_content
+from .entities import QueryEvidenceMode, classify_evidence_mode
 from .evidence import (
     grep_hits_to_search_results,
     merge_search_results,
@@ -17,10 +18,13 @@ from .evidence import (
 )
 from .models import ChunkResult, Document, SearchResult
 from .prompts import AGENT_SYSTEM_PROMPT
+from .retrieval_executor import RetrievalExecutor
 from .retrieval_plan import (
+    CoverageResult,
     CoverageStatus,
     build_retrieval_plan,
     check_coverage,
+    format_coverage_report,
     format_plan,
 )
 
@@ -199,57 +203,6 @@ def append_verified_citations(
     return f"{text}\n\n参考来源：\n{citations}"
 
 
-def requires_campus_evidence(prompt: str) -> bool:
-    """Conservative multi-signal guard; the Agent still chooses which tools to use."""
-    topics = (
-        "新生",
-        "校园",
-        "南大",
-        "南京大学",
-        "学分",
-        "课程",
-        "教务",
-        "门户",
-        "网站",
-        "补办",
-        "转专业",
-        "校区",
-        "住宿",
-        "奖助",
-        "考试",
-        "流程",
-        "录取",
-        "档案",
-        "户口",
-        "团",
-        "军训",
-        "体检",
-        "入学",
-        "报到",
-        "党组织",
-        "团组织",
-    )
-    factual = (
-        "哪里",
-        "怎么",
-        "多少",
-        "什么",
-        "要求",
-        "需要",
-        "时间",
-        "地址",
-        "网站",
-        "办理",
-        "吗",
-        "？",
-        "?",
-    )
-    return sum(token in prompt for token in topics) >= 2 or (
-        any(token in prompt for token in topics)
-        and any(token in prompt for token in factual)
-    )
-
-
 ToolFactory = Callable[[SourceTracker], list[object]]
 ToolLoop = Callable[..., Awaitable[object]]
 
@@ -282,83 +235,102 @@ class NjuQaAgent:
 
         tracker = SourceTracker()
         rows = self.index.all_documents() if self.index is not None else []
-        plan = None
-        plan_text = ""
-        if requires_campus_evidence(prompt) and rows:
-            plan = build_retrieval_plan(prompt, rows)
-            plan_text = format_plan(plan) + "\n\n"
-            logger.info("NJU agent plan: %d subquestions", len(plan))
+        evidence_mode = classify_evidence_mode(prompt)
+        logger.info("NJU agent evidence mode: %s", evidence_mode.value)
 
-        system_prompt = AGENT_SYSTEM_PROMPT
-        if plan_text:
-            system_prompt = f"{AGENT_SYSTEM_PROMPT}\n\n{plan_text}"
+        if evidence_mode == QueryEvidenceMode.CAMPUS_FACTUAL:
+            if rows and self.retriever is not None:
+                return await self._answer_campus_factual(event, prompt, tracker, rows)
+            # Fallback for environments without a configured retriever (e.g. some
+            # unit tests): let the LLM use tools and apply the same evidence gate.
+            return await self._answer_campus_factual_fallback(
+                event, prompt, tracker, rows
+            )
 
+        # Non-factual small talk: use the LLM directly.
         try:
             response = await self._run_tool_loop(
                 event=event,
                 chat_provider_id=provider_id,
                 prompt=prompt,
-                system_prompt=system_prompt,
+                system_prompt=AGENT_SYSTEM_PROMPT,
                 tracker=tracker,
             )
         except Exception:
             logger.exception("NJU agent tool loop failed")
             return AGENT_ERROR
         text = str(getattr(response, "completion_text", "")).strip()
+        result = append_verified_citations(
+            text, tracker.sources, tracker.verified_urls
+        )
+        logger.info("NJU agent direct answer: length=%d", len(result))
+        return result
+
+    async def _answer_campus_factual(
+        self,
+        event: object,
+        prompt: str,
+        tracker: SourceTracker,
+        rows: list[Any],
+    ) -> str:
+        provider_id = await self.context.get_current_chat_provider_id(
+            getattr(event, "unified_msg_origin")
+        )
+        plan = build_retrieval_plan(prompt, rows)
+        logger.info("NJU agent plan: %d subquestions", len(plan))
+
+        executor = RetrievalExecutor(self.retriever, self.index, self.docs_root)
+        exec_result = await executor.execute(plan, tracker)
         logger.info(
-            "NJU agent first response: length=%d sources=%d reliable=%d "
-            "matched=%d read=%d",
-            len(text),
+            "NJU agent executor: sources=%d reliable=%d zero_entity_hits=%d",
             len(tracker.sources),
             tracker.reliable_count,
-            tracker.matched_count,
-            tracker.read_count,
+            len(exec_result.zero_entity_hits),
         )
 
-        if not requires_campus_evidence(prompt):
-            result = append_verified_citations(
-                text, tracker.sources, tracker.verified_urls
-            )
-            logger.info("NJU agent direct answer: length=%d", len(result))
-            return result
-
-        # For campus-factual questions, require reliable sources.
         reliable_sources = [s for s in tracker.sources if s.reliable]
         if not reliable_sources:
             logger.info("NJU agent: no reliable sources for campus question")
             return NO_EVIDENCE
 
-        # Evidence coverage: entity-specific subquestions need DIRECT evidence.
-        if plan is not None:
-            coverage = check_coverage(plan, tracker.sources)
-            for cov in coverage:
-                if cov.need.entity_terms and cov.status != CoverageStatus.DIRECT:
-                    logger.info(
-                        "NJU agent: subquestion %r has only %s evidence",
-                        cov.need.question,
-                        cov.status.value,
-                    )
-                    return NO_EVIDENCE
+        answer_mode = self._classify_answer_mode(exec_result.coverage)
+        if answer_mode == "UNSUPPORTED":
+            logger.info("NJU agent: no direct or background coverage")
+            return NO_EVIDENCE
 
-        # Ground the answer in the most relevant *reliable* sources.  This
-        # selection is reused for the prompt, URL whitelist, and citations.
+        supporting_sources = self._collect_supporting_sources(exec_result.coverage)
         tracker.selected_sources = select_grounding_sources(
-            reliable_sources, max_sources=_MAX_GROUNDING_SOURCES
+            supporting_sources, max_sources=_MAX_GROUNDING_SOURCES
         )
         self._record_selected_documents(tracker)
+        if not tracker.selected_sources:
+            logger.info("NJU agent: no selected grounding sources")
+            return NO_EVIDENCE
+
         logger.info(
-            "NJU agent grounding: selected=%d sources=%d reliable=%d",
+            "NJU agent grounding: mode=%s selected=%d sources=%d reliable=%d",
+            answer_mode,
             len(tracker.selected_sources),
             len(tracker.sources),
             tracker.reliable_count,
         )
-        response = await self._run_tool_loop(
-            event=event,
-            chat_provider_id=provider_id,
-            prompt=self._grounded_prompt(prompt, tracker),
-            system_prompt=AGENT_SYSTEM_PROMPT,
-            tracker=tracker,
+
+        system_prompt = f"{AGENT_SYSTEM_PROMPT}\n\n{format_plan(plan)}"
+        grounded_prompt = self._grounded_prompt(
+            prompt, tracker, exec_result.coverage, answer_mode
         )
+
+        try:
+            response = await self._run_tool_loop(
+                event=event,
+                chat_provider_id=provider_id,
+                prompt=grounded_prompt,
+                system_prompt=system_prompt,
+                tracker=tracker,
+            )
+        except Exception:
+            logger.exception("NJU agent grounded tool loop failed")
+            return AGENT_ERROR
         text = str(getattr(response, "completion_text", "")).strip()
         if not tracker.read_sources:
             logger.info("NJU agent: no documents were read during grounding")
@@ -373,6 +345,136 @@ class NjuQaAgent:
             tracker.reliable_count,
         )
         return result
+
+    async def _answer_campus_factual_fallback(
+        self,
+        event: object,
+        prompt: str,
+        tracker: SourceTracker,
+        rows: list[Any],
+    ) -> str:
+        """Tool-loop fallback when no retriever/index is available."""
+        provider_id = await self.context.get_current_chat_provider_id(
+            getattr(event, "unified_msg_origin")
+        )
+        plan = None
+        system_prompt = AGENT_SYSTEM_PROMPT
+        if rows:
+            plan = build_retrieval_plan(prompt, rows)
+            system_prompt = f"{AGENT_SYSTEM_PROMPT}\n\n{format_plan(plan)}"
+
+        try:
+            response = await self._run_tool_loop(
+                event=event,
+                chat_provider_id=provider_id,
+                prompt=prompt,
+                system_prompt=system_prompt,
+                tracker=tracker,
+            )
+        except Exception:
+            logger.exception("NJU agent fallback tool loop failed")
+            return AGENT_ERROR
+        text = str(getattr(response, "completion_text", "")).strip()
+        logger.info(
+            "NJU agent fallback first response: length=%d sources=%d reliable=%d",
+            len(text),
+            len(tracker.sources),
+            tracker.reliable_count,
+        )
+
+        reliable_sources = [s for s in tracker.sources if s.reliable]
+        if not reliable_sources:
+            logger.info("NJU agent fallback: no reliable sources")
+            return NO_EVIDENCE
+
+        # Entity-specific subquestions still require DIRECT evidence.
+        if plan is not None:
+            coverage = check_coverage(plan, tracker.sources)
+            for cov in coverage:
+                if cov.need.entity_terms and cov.status != CoverageStatus.DIRECT:
+                    logger.info(
+                        "NJU agent fallback: subquestion %r lacks direct evidence",
+                        cov.need.question,
+                    )
+                    return NO_EVIDENCE
+
+        tracker.selected_sources = select_grounding_sources(
+            reliable_sources, max_sources=_MAX_GROUNDING_SOURCES
+        )
+        self._record_selected_documents(tracker)
+        response = await self._run_tool_loop(
+            event=event,
+            chat_provider_id=provider_id,
+            prompt=self._grounded_prompt(prompt, tracker),
+            system_prompt=AGENT_SYSTEM_PROMPT,
+            tracker=tracker,
+        )
+        text = str(getattr(response, "completion_text", "")).strip()
+        if not tracker.read_sources:
+            logger.info("NJU agent fallback: no documents read during grounding")
+            return NO_EVIDENCE
+        return append_verified_citations(
+            text, tracker.selected_sources, tracker.verified_urls
+        )
+
+    @staticmethod
+    def _classify_answer_mode(coverage: list[CoverageResult]) -> str:
+        """Return DIRECT_ANSWER, PARTIAL_ANSWER, BACKGROUND_ONLY or UNSUPPORTED."""
+        has_direct = any(c.status == CoverageStatus.DIRECT for c in coverage)
+        has_background = any(c.status == CoverageStatus.BACKGROUND for c in coverage)
+        has_unsupported = any(
+            c.status == CoverageStatus.UNSUPPORTED for c in coverage
+        )
+        if has_direct:
+            return "PARTIAL_ANSWER" if has_unsupported else "DIRECT_ANSWER"
+        if has_background:
+            return "BACKGROUND_ONLY"
+        return "UNSUPPORTED"
+
+    @staticmethod
+    def _collect_supporting_sources(
+        coverage: list[CoverageResult],
+    ) -> list[SearchResult]:
+        """Gather reliable sources that back DIRECT or BACKGROUND coverage."""
+        supporting: list[SearchResult] = []
+        seen: set[str] = set()
+        for cov in coverage:
+            if cov.status not in (CoverageStatus.DIRECT, CoverageStatus.BACKGROUND):
+                continue
+            for source in cov.sources:
+                if not getattr(source, "reliable", False):
+                    continue
+                key = source.document.yuque_id or source.document.url or source.document.title
+                if key in seen:
+                    continue
+                seen.add(key)
+                supporting.append(source)
+        return supporting
+
+    @property
+    def retriever(self) -> Any:
+        """Best-effort retriever discovery from the configured tools.
+
+        The executor needs a :class:`HybridRetriever`; when the Agent was built
+        without one we derive it from ``search_knowledge_base`` tools.
+        """
+        # Plugins instantiate the Agent before the retriever is attached, so the
+        # retriever is discovered lazily from the tool factory.
+        if hasattr(self, "_retriever") and self._retriever is not None:
+            return self._retriever
+        # Build tools once (without a real tracker) to inspect them.
+        try:
+            dummy_tracker = SourceTracker()
+            tools = self.tools(dummy_tracker)
+            for tool in tools:
+                if getattr(tool, "name", "") == "search_knowledge_base":
+                    retriever = getattr(tool, "retriever", None)
+                    if retriever is not None:
+                        self._retriever = retriever
+                        return retriever
+        except Exception:
+            logger.debug("NJU agent: could not discover retriever from tools")
+        return None
 
     def _read_source_body(self, source: SearchResult, limit: int = 8000) -> str:
         """Return full document body when docs_root is configured, else chunk snippet."""
@@ -402,13 +504,39 @@ class NjuQaAgent:
             )
             tracker.record_read_content(self._read_source_body(source))
 
-    def _grounded_prompt(self, question: str, tracker: SourceTracker) -> str:
+    def _grounded_prompt(
+        self,
+        question: str,
+        tracker: SourceTracker,
+        coverage: list[CoverageResult] | None = None,
+        answer_mode: str | None = None,
+    ) -> str:
         sources = tracker.selected_sources
         materials = "\n\n".join(
             f"[已读材料 {i}]《{source.document.title}》（{source.document.url}）\n{self._read_source_body(source, limit=8000)}"
             for i, source in enumerate(sources, 1)
         )
+
+        coverage_text = ""
+        if coverage:
+            coverage_text = "\n" + format_coverage_report(coverage)
+
+        mode_instructions = {
+            "DIRECT_ANSWER": "所有子问题都有 DIRECT 证据，请直接整理成条理清晰的答案。",
+            "PARTIAL_ANSWER": (
+                "部分子问题只有 DIRECT 证据，其余子问题没有直接证据。"
+                "请明确回答有 DIRECT 证据的部分；对于没有直接证据的子问题，"
+                "直接说明“知识库中暂未找到可靠资料”，不要编造具体事实。"
+            ),
+            "BACKGROUND_ONLY": (
+                "没有针对具体实体的 DIRECT 证据，只有通用背景材料。"
+                "请只根据材料给出通用背景说明，并提醒用户该问题未在知识库中找到针对具体实体的可靠资料。"
+            ),
+        }.get(answer_mode, "")
+
         return f"""请回答原问题：{question}
+
+{mode_instructions}{coverage_text}
 
 我已为你读取了以下最相关的知识库文档（或片段）。请严格根据这些材料作答：
 - 只回答用户实际询问的事项；用户未指定需要逐校区穷举时，不要主动列出材料未覆盖的校区；材料未提及的校区、流程或建议直接略过；不得自行建议前往其他校区办理，除非材料明确支持。
