@@ -11,6 +11,7 @@
 - `grep_local_docs` 新增 `required_phrases` 参数，可强制命中片段同时包含指定短语。
 - `grep_local_docs` 返回 `recommended_read_range`，提示模型按行号精读相关上下文。
 - `read_doc`、`get_doc_details`、`get_doc_outline` 及结构导航工具将结果记录为证据片段。
+- Agent 支持近似名称处理：精确搜索结果不足时提取稳定关键词搜索标题/路径/正文，读取正文验证后仅在证据明确指向同一对象时说明正式名称对应关系。
 - 启动时日志记录插件版本号与当前 git commit SHA。
 
 ### Changed
