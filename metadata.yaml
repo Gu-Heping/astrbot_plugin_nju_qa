@@ -1,7 +1,7 @@
 name: astrbot_plugin_nju_qa
 display_name: NJU QA
 desc: 南京大学知识库问答助手（非官方）
-version: v0.2.0
+version: v0.3.0
 author: peace
 repo: https://github.com/Gu-Heping/astrbot_plugin_nju_qa
 astrbot_version: ">=4.16,<5"
