@@ -1,9 +1,8 @@
-"""Evidence tracking, grep reliability, and grounding source selection tests."""
+"""Evidence tracking, grep reliability, and evidence-first Agent tests."""
 
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -11,15 +10,17 @@ import pytest
 from nju_qa.agent import NO_EVIDENCE, NjuQaAgent, SourceTracker
 from nju_qa.document_index import DocumentIndex
 from nju_qa.evidence import (
+    EvidenceExcerpt,
     build_chunk_from_grep_hit,
     build_document_from_grep_hit,
     document_from_index_row,
     evaluate_grep_reliability,
+    evidence_excerpt_from_read,
+    evidence_excerpt_from_text,
     grep_hits_to_search_results,
     score_grep_hit,
-    select_grounding_sources,
 )
-from nju_qa.models import Document, SearchResult
+from nju_qa.models import Document
 from nju_qa.tools.documents import (
     GetDocDetailsTool,
     GrepLocalDocsTool,
@@ -176,6 +177,25 @@ def sample_hits():
     }
 
 
+def test_evidence_excerpt_factories():
+    doc = _doc(Path("/tmp"), "x.md", "t", "body", "1")
+    excerpt = evidence_excerpt_from_read(doc, "正文")
+    assert excerpt.document_id == "1"
+    assert excerpt.title == "t"
+    assert excerpt.evidence_type == "read"
+
+    nav = evidence_excerpt_from_text("大纲", title="t", file_path="x.md")
+    assert nav.evidence_type == "navigation"
+    assert nav.content == "大纲"
+
+
+def test_source_tracker_assigns_evidence_ids():
+    tracker = SourceTracker()
+    tracker.add_evidence(EvidenceExcerpt(content="a"))
+    tracker.add_evidence(EvidenceExcerpt(content="b"))
+    assert [e.evidence_id for e in tracker.evidence_excerpts] == ["E1", "E2"]
+
+
 def test_grep_reliability_direct_answer_is_reliable(sample_hits):
     reliable, diag = evaluate_grep_reliability(
         sample_hits["direct"], ["校园卡", "补办"]
@@ -268,17 +288,16 @@ def test_grep_hits_convert_to_search_results():
     assert results[1].reliable is False
 
 
-def test_source_tracker_adds_grep_evidence(sample_hits):
+def test_source_tracker_adds_grep_candidates(sample_hits):
     tracker = SourceTracker()
-    tracker.add_grep_hits(
+    tracker.add_candidates(grep_hits_to_search_results(
         [sample_hits["direct"], sample_hits["photo"]], ["校园卡", "补办"]
-    )
-    assert tracker.matched_count == 2
-    assert tracker.reliable_count == 1
-    assert any(s.document.yuque_id == "card123" for s in tracker.sources)
+    ))
+    assert len(tracker.candidate_sources) == 2
+    assert any(s.document.yuque_id == "card123" for s in tracker.candidate_sources)
 
 
-def test_source_tracker_deduplicates_by_yuque_id():
+def test_source_tracker_deduplicates_candidates_by_yuque_id():
     tracker = SourceTracker()
     doc = build_document_from_grep_hit(
         _hit("校园卡补办指南", "c1", ["校园卡", "补办"], " snippet ", "c.md")
@@ -287,44 +306,15 @@ def test_source_tracker_deduplicates_by_yuque_id():
         _hit("校园卡补办指南", "c1", ["校园卡", "补办"], " snippet ", "c.md"),
         ["校园卡", "补办"],
     )
-    tracker.add(
+    from nju_qa.models import SearchResult
+    tracker.add_candidates(
         [
-            SearchResult(
-                "G1", doc, 0.5, chunk=chunk, reliable=False,
-                retrieval_methods=("grep",),
-            ),
-            SearchResult(
-                "S1",
-                doc,
-                0.9,
-                chunk=replace(chunk, reliable=True, final_score=0.9),
-                reliable=True,
-                retrieval_methods=("keyword",),
-            ),
+            SearchResult("G1", doc, 0.5, chunk=chunk, reliable=False, retrieval_methods=("grep",)),
+            SearchResult("S1", doc, 0.9, chunk=chunk, reliable=True, retrieval_methods=("keyword",)),
         ]
     )
-    assert tracker.matched_count == 1
-    assert tracker.reliable_count == 1
-    assert tracker.sources[0].retrieval_methods == ("grep", "keyword")
-
-
-def test_select_grounding_sources_prefers_reliable_and_drops_unreliable():
-    def make(source_id: str, score: float, reliable: bool, yuque_id: str):
-        doc = Document(
-            yuque_id, "t", "r", "n", "s", "u", "a", "b", "body", path=Path(f"{yuque_id}.md")
-        )
-        return SearchResult(source_id, doc, score, reliable=reliable)
-
-    sources = [
-        make("S1", 0.9, False, "d1"),
-        make("S2", 0.6, True, "d2"),
-        make("S3", 0.3, True, "d3"),
-    ]
-    selected = select_grounding_sources(sources, max_sources=2)
-    assert len(selected) == 2
-    assert selected[0].source_id == "S2"
-    assert selected[1].source_id == "S3"
-    assert all(s.reliable for s in selected)
+    assert len(tracker.candidate_sources) == 1
+    assert tracker.candidate_sources[0].score == 0.9
 
 
 def test_document_from_index_row():
@@ -339,7 +329,7 @@ def test_document_from_index_row():
     assert rebuilt.body == "new body"
 
 
-def test_grep_tool_registers_unified_evidence(tmp_path):
+def test_grep_tool_registers_candidates(tmp_path):
     index = _index_with_docs(tmp_path)
     tracker = SourceTracker()
     tool = GrepLocalDocsTool(
@@ -347,63 +337,29 @@ def test_grep_tool_registers_unified_evidence(tmp_path):
     )
     result = asyncio.run(tool._run("校园卡 补办"))
     assert result["count"] >= 1
-    assert tracker.matched_count >= 1
-    assert tracker.reliable_count >= 1
-    assert any(s.document.yuque_id == "card123" for s in tracker.sources)
+    assert len(tracker.candidate_sources) >= 1
+    assert any(s.document.yuque_id == "card123" for s in tracker.candidate_sources)
 
 
-def test_grep_only_campus_question_does_not_return_no_evidence(tmp_path):
+def test_grep_required_phrases_filters_results(tmp_path):
     index = _index_with_docs(tmp_path)
-
-    def tool_factory(tracker):
-        return [
-            GrepLocalDocsTool(
-                index=index, docs_root=tmp_path, tracker=tracker
-            )
-        ]
-
-    async def loop(**kwargs):
-        tools = kwargs["tools"]
-        grep = next(t for t in tools if t.name == "grep_local_docs")
-        await grep._run("校园卡 补办")
-        return _Response(
-            "校园卡可在信息化建设管理服务中心一楼大厅补办，费用 20 元。"
-        )
-
-    agent = NjuQaAgent(_Context(), tool_factory, loop, docs_root=tmp_path)
-    answer = asyncio.run(agent.answer(_Event(), "校园卡在哪里补办？"))
-    assert answer != NO_EVIDENCE
-    assert "信息化建设管理服务中心" in answer
+    tracker = SourceTracker()
+    tool = GrepLocalDocsTool(index=index, docs_root=tmp_path, tracker=tracker)
+    result = asyncio.run(tool._run("校园卡", required_phrases="鼓楼 20元"))
+    assert result["count"] == 0
+    result = asyncio.run(tool._run("校园卡", required_phrases="补办 20"))
+    assert result["count"] >= 1
 
 
-def test_read_doc_marks_source_read_and_merges_methods(tmp_path):
+def test_read_doc_records_evidence_excerpt(tmp_path):
     index = _index_with_docs(tmp_path)
-    captured: dict = {}
-
-    def tool_factory(tracker):
-        captured["tracker"] = tracker
-        return [
-            GrepLocalDocsTool(
-                index=index, docs_root=tmp_path, tracker=tracker
-            ),
-            ReadDocTool(index=index, docs_root=tmp_path, tracker=tracker),
-        ]
-
-    async def loop(**kwargs):
-        tools = kwargs["tools"]
-        grep = next(t for t in tools if t.name == "grep_local_docs")
-        read = next(t for t in tools if t.name == "read_doc")
-        await grep._run("校园卡 补办")
-        source = next(s for s in captured["tracker"].sources if s.reliable)
-        await read._run(str(source.document.path))
-        return _Response("已读取材料")
-
-    agent = NjuQaAgent(_Context(), tool_factory, loop, docs_root=tmp_path)
-    asyncio.run(agent.answer(_Event(), "校园卡在哪里补办？"))
-    tracker = captured["tracker"]
-    source = next(s for s in tracker.sources if s.document.yuque_id == "card123")
-    assert "read" in source.retrieval_methods
-    assert str(source.document.path) in tracker.read_sources
+    tracker = SourceTracker()
+    tool = ReadDocTool(index=index, docs_root=tmp_path, tracker=tracker)
+    result = asyncio.run(tool._run(file_path="card.md"))
+    assert "content" in result
+    assert len(tracker.evidence_excerpts) == 1
+    assert tracker.evidence_excerpts[0].document_id == "card123"
+    assert "card.md" in tracker.read_sources
 
 
 def test_get_doc_details_content_registers_evidence(tmp_path):
@@ -415,8 +371,8 @@ def test_get_doc_details_content_registers_evidence(tmp_path):
 
     result = asyncio.run(tool._run(yuque_id="card123", include_content=True))
     assert "content" in result
-    assert tracker.matched_count == 1
-    assert str(tracker.sources[0].document.path) in tracker.read_sources
+    assert len(tracker.evidence_excerpts) == 1
+    assert tracker.evidence_excerpts[0].document_id == "card123"
 
 
 def test_get_doc_details_without_content_does_not_register_evidence(tmp_path):
@@ -428,7 +384,7 @@ def test_get_doc_details_without_content_does_not_register_evidence(tmp_path):
 
     result = asyncio.run(tool._run(yuque_id="card123", include_content=False))
     assert "results" in result
-    assert tracker.matched_count == 0
+    assert len(tracker.evidence_excerpts) == 0
     assert tracker.read_count == 0
 
 
@@ -440,8 +396,7 @@ def test_empty_grep_does_not_create_fake_sources(tmp_path):
     )
     result = asyncio.run(tool._run("完全不存在的词"))
     assert result["count"] == 0
-    assert tracker.matched_count == 0
-    assert tracker.reliable_count == 0
+    assert len(tracker.candidate_sources) == 0
 
 
 def test_grep_hit_with_missing_path_is_handled():
@@ -465,9 +420,69 @@ def test_grep_fallback_to_bigram_terms(tmp_path):
     tool = GrepLocalDocsTool(
         index=index, docs_root=tmp_path, tracker=tracker
     )
-    # "挂失补办" is not in text, but splitting into "挂失 补办" won't help.
-    # Use a phrase that appears only as substrings.
     result = asyncio.run(tool._run("信息建设中"))
-    # Fallback should still find something if any bigram matches.
     assert isinstance(result, dict)
     assert "count" in result
+
+
+def test_agent_returns_no_evidence_without_read_content():
+    async def loop(**kwargs):
+        return _Response("校园卡可在中心补办。")
+
+    agent = NjuQaAgent(_Context(), lambda tracker: [], loop)
+    answer = asyncio.run(agent.answer(_Event(), "校园卡在哪里补办？"))
+    assert answer == NO_EVIDENCE
+
+
+def test_agent_answer_uses_only_read_evidence_and_strips_markers():
+    index = _index_with_docs(tmp_path := Path(__file__).parent / "_tmp_evidence")
+    index  # ensure index created in tmp
+
+    def tool_factory(tracker):
+        return [
+            GrepLocalDocsTool(index=index, docs_root=tmp_path, tracker=tracker),
+            ReadDocTool(index=index, docs_root=tmp_path, tracker=tracker),
+        ]
+
+    async def loop(**kwargs):
+        tools = kwargs["tools"]
+        read = next(t for t in tools if t.name == "read_doc")
+        await read._run(file_path="card.md")
+        return _Response("校园卡可在信息化建设管理服务中心补办 [E1]。")
+
+    agent = NjuQaAgent(_Context(), tool_factory, loop, docs_root=tmp_path)
+    answer = asyncio.run(agent.answer(_Event(), "校园卡在哪里补办？"))
+    assert "信息化建设管理服务中心" in answer
+    assert "[E1]" not in answer
+    assert "参考来源" in answer
+    assert "https://yuque.test/nju/guide/card" in answer
+
+    # cleanup
+    import shutil
+
+    shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_agent_strips_fake_url_and_keeps_verified_url():
+    index = _index_with_docs(tmp_path := Path(__file__).parent / "_tmp_evidence2")
+
+    def tool_factory(tracker):
+        return [
+            GrepLocalDocsTool(index=index, docs_root=tmp_path, tracker=tracker),
+            ReadDocTool(index=index, docs_root=tmp_path, tracker=tracker),
+        ]
+
+    async def loop(**kwargs):
+        tools = kwargs["tools"]
+        read = next(t for t in tools if t.name == "read_doc")
+        await read._run(file_path="card.md")
+        return _Response("校园卡可在中心补办 [E1]，详情见 https://fake.test。")
+
+    agent = NjuQaAgent(_Context(), tool_factory, loop, docs_root=tmp_path)
+    answer = asyncio.run(agent.answer(_Event(), "校园卡在哪里补办？"))
+    assert "https://fake.test" not in answer
+    assert "https://yuque.test/nju/guide/card" in answer
+
+    import shutil
+
+    shutil.rmtree(tmp_path, ignore_errors=True)

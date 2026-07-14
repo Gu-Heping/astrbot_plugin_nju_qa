@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import subprocess
 from pathlib import Path
 
 from astrbot.api import logger
@@ -62,9 +63,11 @@ def _build_rich_result(event: AstrMessageEvent, segments: list[tuple[str, str]])
     return event.chain_result(chain)
 
 
-@register("astrbot_plugin_nju_qa", "peace", "南京大学知识库问答助手", "0.2.0")
+@register("astrbot_plugin_nju_qa", "peace", "南京大学知识库问答助手", "0.3.0")
 class NjuQaPlugin(Star):
     """Explicitly triggered NJU knowledge-base Q&A plugin."""
+
+    VERSION = "0.3.0"
 
     def __init__(self, context: Context, config=None):
         super().__init__(context)
@@ -147,6 +150,25 @@ class NjuQaPlugin(Star):
         )
         self._sync_task: asyncio.Task | None = None
         self._rebuild_task: asyncio.Task | None = None
+        self._log_version()
+
+    def _log_version(self) -> None:
+        """Log plugin version and current git commit SHA for diagnostics."""
+        try:
+            commit = (
+                subprocess.run(
+                    ["git", "rev-parse", "--short", "HEAD"],
+                    cwd=Path(__file__).parent,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                .stdout.strip()
+                or "unknown"
+            )
+        except Exception:
+            commit = "unknown"
+        logger.info("NJU QA plugin v%s (commit %s)", self.VERSION, commit)
 
     async def initialize(self):
         self.index.open()

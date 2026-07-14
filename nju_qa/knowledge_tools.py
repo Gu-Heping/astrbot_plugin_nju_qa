@@ -11,7 +11,7 @@ from .retriever import HybridRetriever
 async def search_knowledge_base(
     retriever: HybridRetriever, tracker: SourceTracker, query: str, **scope
 ) -> dict:
-    """Search and record source evidence returned to the Agent."""
+    """Search and record candidate sources returned to the Agent."""
 
     if not retriever.index.all_documents():
         return {
@@ -26,7 +26,9 @@ async def search_knowledge_base(
             "reason": "知识库中暂未找到可靠答案。",
             "candidates": [],
         }
-    tracker.add(results)
+    # Search/grep hits are candidates only; the model must read the actual
+    # document to turn them into grounded evidence.
+    tracker.add_candidates(results)
     return {
         "reliable": all(r.reliable for r in results),
         "candidates": [_result_to_dict(r.chunk, r) for r in results],

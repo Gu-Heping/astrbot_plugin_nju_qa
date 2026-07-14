@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -21,6 +22,10 @@ from ..evidence import (
     _canonical_action,
     document_from_index_row,
     evaluate_grep_reliability,
+    evidence_excerpt_from_text,
+    filter_by_required_phrases,
+    grep_hits_to_search_results,
+    recommended_read_range,
     score_grep_hit,
 )
 from ..knowledge_structure import (
@@ -115,6 +120,22 @@ class _Tool(FunctionTool):
     async def run(self, event: AstrMessageEvent, **kwargs):
         return await self._run(**kwargs)
 
+    def _record_navigation_evidence(
+        self, *, title: str, file_path: str = "", content: str, url: str = ""
+    ) -> None:
+        """Record a structure/navigation tool result as candidate evidence."""
+        if not self.tracker or not content:
+            return
+        self.tracker.add_evidence(
+            evidence_excerpt_from_text(
+                content=content[:2400],
+                title=title,
+                file_path=file_path,
+                url=url,
+                evidence_type="navigation",
+            )
+        )
+
 
 @dataclass
 class GrepLocalDocsTool(_Tool):
@@ -159,6 +180,10 @@ class GrepLocalDocsTool(_Tool):
                     "default": 2,
                     "description": "匹配行前后保留的上下文行数",
                 },
+                "required_phrases": {
+                    "type": "string",
+                    "description": "空格分隔的短语，命中片段必须同时包含这些短语",
+                },
                 "limit": {"type": "integer", "default": 10},
             },
             "required": ["keywords"],
@@ -175,10 +200,12 @@ class GrepLocalDocsTool(_Tool):
         document_ids: str = "",
         include_archived: bool = True,
         context_lines: int = 2,
+        required_phrases: str = "",
         limit: int = 10,
         **_,
     ) -> dict:
         terms = [x for x in keywords.split() if x]
+        required = [x for x in required_phrases.split() if x]
         repo = repository or repo_filter
         ids = _parse_document_ids(document_ids)
         hits = self._search(
@@ -209,26 +236,35 @@ class GrepLocalDocsTool(_Tool):
                     context_lines=context_lines,
                     limit=limit,
                 )
+
+        if required:
+            hits = filter_by_required_phrases(hits, required)
+
         if self.tracker:
-            # Re-rank and register as unified evidence.
+            # Grep hits are candidate evidence only; the model must read the
+            # actual document to ground an answer.
             hits = sorted(hits, key=lambda h: score_grep_hit(h, terms), reverse=True)
             reliable_count = sum(
                 1 for h in hits if evaluate_grep_reliability(h, terms)[0]
             )
-            tracked_before = len(self.tracker.sources)
-            self.tracker.add_grep_hits(hits, terms)
-            tracked_after = len(self.tracker.sources)
+            before = len(self.tracker.candidate_sources)
+            self.tracker.add_candidates(grep_hits_to_search_results(hits, terms))
+            after = len(self.tracker.candidate_sources)
             logger.info(
                 "NJU grep evidence: query=%r hits=%d reliable=%d "
-                "tracked_before=%d tracked_after=%d added=%d merged=%d",
+                "candidates_before=%d candidates_after=%d added=%d",
                 keywords,
                 len(hits),
                 reliable_count,
-                tracked_before,
-                tracked_after,
-                tracked_after - tracked_before,
-                len(hits) - (tracked_after - tracked_before),
+                before,
+                after,
+                after - before,
             )
+
+        # Surface a recommended line range so the model can read efficiently.
+        for hit in hits:
+            hit["recommended_read_range"] = recommended_read_range(hit)
+
         return {"count": len(hits), "results": hits}
 
     def _search(
@@ -410,8 +446,14 @@ class ReadDocTool(_Tool):
                 document = document_from_index_row(row, result["content"])
                 self.tracker.add_read_document(document, result["content"])
             else:
-                self.tracker.read_sources.add(resolved_path)
-                self.tracker.record_read_content(result["content"])
+                self.tracker.add_evidence(
+                    evidence_excerpt_from_text(
+                        content=result["content"][:2400],
+                        title=resolved_path,
+                        file_path=resolved_path,
+                        evidence_type="read",
+                    )
+                )
         return result
 
 
@@ -551,8 +593,15 @@ class GetDocDetailsTool(_Tool):
                 document = document_from_index_row(row, result["content"])
                 self.tracker.add_read_document(document, result["content"])
             else:
-                self.tracker.read_sources.add(results[0]["path"])
-                self.tracker.record_read_content(result["content"])
+                self.tracker.add_evidence(
+                    evidence_excerpt_from_text(
+                        content=result["content"][:2400],
+                        title=results[0].get("title", results[0]["path"]),
+                        file_path=results[0]["path"],
+                        url=results[0].get("url", ""),
+                        evidence_type="details",
+                    )
+                )
         return result
 
 
@@ -615,7 +664,13 @@ class ListKnowledgeBasesTool(_Tool):
                     ],
                 }
             )
-        return {"knowledge_bases": knowledge_bases}
+        result = {"knowledge_bases": knowledge_bases}
+        if self.tracker:
+            self._record_navigation_evidence(
+                title="已同步知识库列表",
+                content=json.dumps(knowledge_bases, ensure_ascii=False, indent=2),
+            )
+        return result
 
 
 @dataclass
@@ -682,13 +737,20 @@ class ListRepoDocsTool(_Tool):
             }
             for child in (tree.children if tree else ())
         ]
-        return {
+        result = {
             "documents": docs,
             "categories": categories,
             "count": len(docs),
             "has_more": has_more,
             "next_offset": offset + len(docs) if has_more else None,
         }
+        if self.tracker:
+            self._record_navigation_evidence(
+                title=f"知识库 {namespace} 文档列表",
+                file_path=path_prefix,
+                content=json.dumps(result, ensure_ascii=False, indent=2),
+            )
+        return result
 
 
 @dataclass
@@ -746,11 +808,18 @@ class ListRepoTreeTool(_Tool):
                 "children": [node_to_dict(child) for child in node.children],
             }
 
-        return {
+        result = {
             "tree_text": tree_to_text(tree),
             "tree": node_to_dict(tree),
             "count": tree.document_count,
         }
+        if self.tracker:
+            self._record_navigation_evidence(
+                title=f"知识库 {namespace} 目录树",
+                file_path=path_prefix,
+                content=result["tree_text"],
+            )
+        return result
 
 
 @dataclass
@@ -836,20 +905,28 @@ class GetDocOutlineTool(_Tool):
             headings.sort(key=_relevance, reverse=True)
             headings = headings[:limit]
             # Keep relevance order when a query is provided.
-            return {
+            result = {
+                "file_path": file_path,
+                "title": headings[0]["title"] if headings else "",
+                "section_count": len(headings),
+                "sections": headings,
+            }
+        else:
+            headings.sort(key=lambda h: h["line_number"])
+            result = {
                 "file_path": file_path,
                 "title": headings[0]["title"] if headings else "",
                 "section_count": len(headings),
                 "sections": headings,
             }
 
-        headings.sort(key=lambda h: h["line_number"])
-        return {
-            "file_path": file_path,
-            "title": headings[0]["title"] if headings else "",
-            "section_count": len(headings),
-            "sections": headings,
-        }
+        if self.tracker:
+            self._record_navigation_evidence(
+                title=f"文档大纲：{result.get('title', file_path)}",
+                file_path=file_path,
+                content=json.dumps(result, ensure_ascii=False, indent=2),
+            )
+        return result
 
 
 @dataclass

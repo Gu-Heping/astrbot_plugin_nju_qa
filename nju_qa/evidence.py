@@ -11,6 +11,77 @@ from pathlib import Path
 from .models import ChunkResult, Document, SearchResult
 
 
+@dataclass
+class EvidenceExcerpt:
+    """A concrete piece of evidence that has been read into the Agent context."""
+
+    evidence_id: str = ""
+    document_id: str = ""
+    title: str = ""
+    url: str = ""
+    file_path: str = ""
+    line_start: int | None = None
+    line_end: int | None = None
+    content: str = ""
+    evidence_type: str = "read"  # read | details | outline | navigation
+    qa_status: str | None = None
+    historical: bool = False
+    score: float = 0.0
+
+
+def evidence_excerpt_from_read(
+    document: Document,
+    content: str,
+    *,
+    line_start: int | None = None,
+    line_end: int | None = None,
+    evidence_type: str = "read",
+    score: float = 0.0,
+) -> EvidenceExcerpt:
+    """Build an EvidenceExcerpt from a document read operation."""
+    historical, _ = is_historical_document(
+        document.title, str(document.path or "")
+    )
+    return EvidenceExcerpt(
+        document_id=document.yuque_id,
+        title=document.title,
+        url=document.url,
+        file_path=str(document.path or ""),
+        line_start=line_start,
+        line_end=line_end,
+        content=content,
+        evidence_type=evidence_type,
+        qa_status=classify_qa_window(content).value,
+        historical=historical,
+        score=score,
+    )
+
+
+def evidence_excerpt_from_text(
+    content: str,
+    *,
+    title: str = "",
+    file_path: str = "",
+    url: str = "",
+    document_id: str = "",
+    evidence_type: str = "navigation",
+) -> EvidenceExcerpt:
+    """Build an EvidenceExcerpt from a structured/navigation output."""
+    return EvidenceExcerpt(
+        document_id=document_id,
+        title=title,
+        url=url,
+        file_path=file_path,
+        line_start=None,
+        line_end=None,
+        content=content,
+        evidence_type=evidence_type,
+        qa_status=None,
+        historical=False,
+        score=0.0,
+    )
+
+
 # Lightweight action synonym dictionary.  Keep it small and testable.
 _ACTION_SYNONYMS: dict[str, frozenset[str]] = {
     "补办": frozenset({"补办", "补卡", "重办"}),
@@ -767,3 +838,31 @@ def merge_search_results(a: SearchResult, b: SearchResult) -> SearchResult:
         retrieval_methods=methods,
         reliable=reliable,
     )
+
+
+def recommended_read_range(hit: dict) -> dict[str, int]:
+    """Return the inclusive line range that covers all matched windows in ``hit``."""
+    matches = hit.get("matches", [])
+    if not matches:
+        return {}
+    starts = [m.get("line_start") for m in matches if m.get("line_start") is not None]
+    ends = [m.get("line_end") for m in matches if m.get("line_end") is not None]
+    if not starts or not ends:
+        return {}
+    return {"start_line": min(starts), "end_line": max(ends)}
+
+
+def filter_by_required_phrases(hits: list[dict], phrases: list[str]) -> list[dict]:
+    """Keep only hits whose combined snippets contain every required phrase.
+
+    Phrases are matched case-insensitively.  An empty phrase list is a no-op.
+    """
+    if not phrases:
+        return hits
+    required = [p.casefold() for p in phrases if p.strip()]
+    filtered: list[dict] = []
+    for hit in hits:
+        body = _combine_grep_snippets(hit).casefold()
+        if all(phrase in body for phrase in required):
+            filtered.append(hit)
+    return filtered

@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from nju_qa.agent import NO_PROVIDER, NjuQaAgent, SourceTracker
+from nju_qa.evidence import evidence_excerpt_from_text
 from nju_qa.knowledge_tools import search_knowledge_base
 from nju_qa.models import Document, SearchResult
 from nju_qa.routing import MessageRouter, mark_command_handled
@@ -74,35 +75,20 @@ class Context:
         return self.provider
 
 
-def test_normal_chat_uses_one_llm_call_without_forcing_search():
+def test_small_talk_uses_one_llm_call_without_search():
     calls = []
 
     async def loop(**kwargs):
         calls.append(kwargs)
-        return Response("你好！我是南京大学校园问答助手。")
+        return Response("你好！我是由 NOVA 开发的南京大学校园问答助手。")
 
     agent = NjuQaAgent(
-        Context(), lambda tracker: [type("Tool", (), {"tracker": tracker})()], loop
+        Context(), lambda tracker: [], loop
     )
     answer = asyncio.run(agent.answer(Event(), "你好"))
     assert answer.startswith("你好")
     assert len(calls) == 1
-
-
-def test_fact_answer_can_only_cite_tool_tracked_sources():
-    async def loop(**kwargs):
-        kwargs["tools"][0].tracker.add([source()])
-        kwargs["tools"][0].tracker.read_sources.add("doc.md")
-        return Response(
-            "通识课要求见资料：https://fake.test\n参考来源：\n1. 《伪造》：https://fake.test"
-        )
-
-    agent = NjuQaAgent(
-        Context(), lambda tracker: [type("Tool", (), {"tracker": tracker})()], loop
-    )
-    answer = asyncio.run(agent.answer(Event(), "通识课需要多少学分？"))
-    assert "https://yuque.test/doc" in answer
-    assert "https://fake.test" not in answer
+    assert "RESEARCH" not in str(calls[0].get("system_prompt", ""))
 
 
 def test_no_provider_is_friendly_and_does_not_run_agent():
@@ -110,49 +96,37 @@ def test_no_provider_is_friendly_and_does_not_run_agent():
     assert asyncio.run(agent.answer(Event(), "你好")) == NO_PROVIDER
 
 
-def test_fact_search_without_agent_read_retries_with_selected_document_body():
-    calls = []
-
-    async def loop(**kwargs):
-        calls.append(kwargs)
-        if len(calls) == 1:
-            kwargs["tools"][0].tracker.add([source()])
-        return Response("基于已读材料的回答")
-
-    agent = NjuQaAgent(
-        Context(), lambda tracker: [type("Tool", (), {"tracker": tracker})()], loop
-    )
-    answer = asyncio.run(agent.answer(Event(), "通识课需要多少学分？"))
-    assert len(calls) == 2 and "已读材料" in calls[1]["prompt"]
-    assert "https://yuque.test/doc" in answer
-
-
-def test_no_tool_results_leave_no_fake_citation():
-    async def loop(**kwargs):
-        return Response("知识库中暂未找到可靠答案")
-
-    agent = NjuQaAgent(Context(), lambda tracker: [], loop)
-    assert "参考来源" not in asyncio.run(agent.answer(Event(), "校园卡在哪里补办？"))
-
-
-def test_citations_are_deduplicated_from_actual_tool_results():
+def test_citations_are_deduplicated_from_actual_evidence():
     tracker = SourceTracker()
-    tracker.add([source(), source()])
-    assert len(tracker.sources) == 1
-
-
-def test_verified_website_url_from_read_document_is_preserved():
-    tracker = SourceTracker()
-    tracker.record_read_content("官方入口：https://portal.nju.edu.cn")
-    from nju_qa.agent import append_verified_citations
-
-    answer = append_verified_citations(
-        "请访问 https://portal.nju.edu.cn；不要访问 https://fake.test",
-        [],
-        tracker.verified_urls,
+    tracker.add_read_document(
+        Document(
+            "1", "t", "r", "n", "s", "https://yuque.test/doc",
+            "a", "b", "body", path=Path("doc.md"),
+        ),
+        "content",
     )
-    assert "https://portal.nju.edu.cn" in answer
-    assert "https://fake.test" not in answer
+    # Adding the same document again should not duplicate read_sources.
+    tracker.add_read_document(
+        Document(
+            "1", "t", "r", "n", "s", "https://yuque.test/doc",
+            "a", "b", "body", path=Path("doc.md"),
+        ),
+        "content",
+    )
+    assert len(tracker.evidence_excerpts) == 2
+    assert len(tracker.read_sources) == 1
+
+
+def test_verified_url_is_recorded_from_read_content():
+    tracker = SourceTracker()
+    tracker.add_evidence(
+        evidence_excerpt_from_text(
+            "官方入口：https://portal.nju.edu.cn",
+            title="t",
+            file_path="doc.md",
+        )
+    )
+    assert "https://portal.nju.edu.cn" in tracker.verified_urls
 
 
 class Index:
@@ -174,12 +148,13 @@ class Retriever:
         return self.results
 
 
-def test_campus_question_searches_tool_and_returns_only_its_source():
+def test_search_knowledge_base_registers_candidates():
     retriever = Retriever([source()])
     tracker = SourceTracker()
     output = asyncio.run(search_knowledge_base(retriever, tracker, "通识课学分"))
     assert retriever.queries == ["通识课学分"]
-    assert tracker.sources == [source()]
+    assert len(tracker.candidate_sources) == 1
+    assert tracker.candidate_sources[0].document.yuque_id == "1"
     assert output["candidates"][0]["source_url"] == "https://yuque.test/doc"
 
 
@@ -188,3 +163,32 @@ def test_unsynced_knowledge_base_tells_user_to_contact_admin():
         search_knowledge_base(Retriever([], rows=False), SourceTracker(), "校园卡")
     )
     assert "/nju_sync" in output["reason"]
+
+
+def test_fact_question_without_read_evidence_returns_no_evidence():
+    async def loop(**kwargs):
+        # Research phase returns text but never reads a document.
+        return Response("根据经验，校园卡可在中心补办。")
+
+    agent = NjuQaAgent(Context(), lambda tracker: [], loop)
+    answer = asyncio.run(agent.answer(Event(), "校园卡在哪里补办？"))
+    assert "知识库中暂未找到可靠资料" in answer
+
+
+def test_answer_without_evidence_markers_is_rejected():
+    doc = Document(
+        "1", "t", "r", "n", "s", "https://yuque.test/doc",
+        "a", "b", "body", path=Path("doc.md"),
+    )
+
+    async def loop(**kwargs):
+        if kwargs.get("system_prompt", "").startswith("你是南京大学校园问答助手"):
+            return Response("校园卡可在中心补办")  # missing [E#]
+        return Response("ignored")
+
+    agent = NjuQaAgent(Context(), lambda tracker: [], loop)
+    tracker = SourceTracker()
+    tracker.add_read_document(doc, "校园卡可在中心补办")
+    # Patch agent's answer phase by injecting the tracker manually.
+    answer = asyncio.run(agent._answer_phase(Event(), "校园卡在哪里补办？", tracker))
+    assert "知识库中暂未找到可靠资料" in answer or "无法" in answer

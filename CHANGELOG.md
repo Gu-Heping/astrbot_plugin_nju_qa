@@ -4,7 +4,27 @@
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-07-13
+### Added
+
+- 证据优先两阶段 Agent：研究阶段调用工具收集证据，回答阶段只能使用实际读取的证据片段，并用 `[E#]` 内部标记绑定引用。
+- `EvidenceExcerpt` 统一证据模型，记录来源、行号、内容、QA 状态、历史资料标记和分数。
+- `grep_local_docs` 新增 `required_phrases` 参数，可强制命中片段同时包含指定短语。
+- `grep_local_docs` 返回 `recommended_read_range`，提示模型按行号精读相关上下文。
+- `read_doc`、`get_doc_details`、`get_doc_outline` 及结构导航工具将结果记录为证据片段。
+- 启动时日志记录插件版本号与当前 git commit SHA。
+
+### Changed
+
+- 重构 `nju_qa/agent.py`：移除规则驱动的状态机，改为 `NjuQaAgent` 两阶段调度；研究阶段忽略模型生成的自然语言，仅收集工具证据。
+- 移除 `QueryEvidenceMode`、`RetrievalPlan`、`RetrievalExecutor`、`CoverageStatus`、Python 正则子问题拆分和 `core_terms` 证据门控。
+- 简化实体处理：不再依赖复杂正则实体提取作为回答前提，Agent 通过工具自行定位相关文档。
+- `search_knowledge_base` 仅注册候选来源；最终回答必须基于 `read_doc` 等工具产生的证据。
+- 更新系统提示词为研究/回答/寒暄三份独立提示，明确证据约束和引用规则。
+- 版本号提升至 0.3.0。
+
+### Removed
+
+- 删除 `nju_qa/entities.py`、`nju_qa/retrieval_plan.py`、`nju_qa/retrieval_executor.py` 及其对应测试文件。
 
 ### Added
 

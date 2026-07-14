@@ -1,166 +1,90 @@
-"""Thin adapter around AstrBot's native tool-loop agent."""
+"""Evidence-first two-stage Agent for NJU QA.
+
+The Agent splits every factual question into two phases:
+
+1. Research phase: the model may use search/navigation/reading tools to locate
+   and read concrete evidence.  The natural-language text produced by this
+   phase is ignored; only the evidence that was actually read is retained.
+
+2. Answer phase: the model receives the original question and the collected
+   evidence excerpts, and must answer using only those excerpts.  Every factual
+   claim must be marked with an internal evidence id ``[E#]``.  Citations are
+   rendered only for the excerpts the model actually used.
+"""
 
 from __future__ import annotations
 
 import re
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from astrbot.api import logger
 
 from .doc_utils import read_document_content
-from .entities import QueryEvidenceMode, classify_evidence_mode
 from .evidence import (
-    grep_hits_to_search_results,
-    merge_search_results,
-    select_grounding_sources,
+    EvidenceExcerpt,
+    _NO_ANSWER_MARKERS,
+    evidence_excerpt_from_read,
 )
-from .models import ChunkResult, Document, SearchResult
-from .prompts import AGENT_SYSTEM_PROMPT
-from .retrieval_executor import RetrievalExecutor
-from .retrieval_plan import (
-    CoverageResult,
-    CoverageStatus,
-    build_retrieval_plan,
-    check_coverage,
-    format_coverage_report,
-    format_plan,
+from .models import SearchResult
+from .prompts import (
+    ANSWER_SYSTEM_PROMPT,
+    RESEARCH_SYSTEM_PROMPT,
+    SMALL_TALK_SYSTEM_PROMPT,
 )
 
 
 NO_PROVIDER = "当前未配置 LLM 服务。请联系管理员配置后再试。"
 AGENT_ERROR = "当前无法调用 LLM 服务，请稍后重试。"
 NO_EVIDENCE = "知识库中暂未找到可靠资料，我不能据此给出南京大学的具体结论。"
+SAFE_FAILURE = "当前无法根据知识库给出可靠回答，请稍后重试或换个方式提问。"
 
-_MAX_GROUNDING_SOURCES = 7
+_MAX_EVIDENCE = 7
+_MAX_RESEARCH_STEPS = 12
+_MAX_ANSWER_STEPS = 3
 _NO_EVIDENCE_MARKERS = ("知识库中暂未找到可靠资料", "知识库中暂未找到可靠答案")
 
+_SMALL_TALK_PATTERNS: list[re.Pattern] = [
+    re.compile(r"^(你好|您好|嗨|哈喽|hello|hi|hey|在吗|在不在|早上好|下午好|晚上好)([！!。，,\s]|$)", re.IGNORECASE),
+    re.compile(r"^(谢谢|多谢|感谢|拜拜|再见|bye|goodbye)([！!。，,\s]|$)", re.IGNORECASE),
+    re.compile(r"^(你?是谁|你叫什么|你叫什么名字|介绍一下你|自我介绍一下)"),
+    re.compile(r"^(你?能做什么|你?会什么|你?有什么功能|帮助|help|怎么用)"),
+    re.compile(r"^(好的|行|可以|ok|okay|知道了|明白)([！!。，,\s]|$)", re.IGNORECASE),
+]
 
-class SourceTracker:
-    """Collects only sources that an Agent tool actually returned this turn."""
 
-    def __init__(self) -> None:
-        self.sources: list[SearchResult] = []
-        self.selected_sources: list[SearchResult] = []
-        self.read_sources: set[str] = set()
-        self.verified_urls: set[str] = set()
+def _is_small_talk(prompt: str) -> bool:
+    """Return True only for a small set of pure conversational openers."""
+    text = prompt.strip().casefold()
+    if not text:
+        return True
+    for pattern in _SMALL_TALK_PATTERNS:
+        if pattern.search(text):
+            return True
+    return False
 
-    def reset(self) -> None:
-        self.sources.clear()
-        self.selected_sources.clear()
-        self.read_sources.clear()
-        self.verified_urls.clear()
 
-    def record_read_content(self, content: str) -> None:
-        self.verified_urls.update(re.findall(r"https?://[^\s<>()，。；：]+", content))
+def _strip_unverified_urls(text: str, allowed_urls: set[str]) -> str:
+    """Remove URLs not present in ``allowed_urls`` to prevent hallucinated links."""
 
-    def add(self, results: list[SearchResult]) -> None:
-        """Add or merge retrieval results into the unified evidence list."""
-        by_id: dict[str, int] = {
-            item.document.yuque_id: i for i, item in enumerate(self.sources)
-        }
-        for item in results:
-            if not item.document.yuque_id:
-                # Documents without a stable id are appended as-is (rare).
-                self.sources.append(item)
-                continue
-            idx = by_id.get(item.document.yuque_id)
-            if idx is None:
-                self.sources.append(item)
-                by_id[item.document.yuque_id] = len(self.sources) - 1
-            else:
-                merged = merge_search_results(self.sources[idx], item)
-                self.sources[idx] = merged
-                by_id[item.document.yuque_id] = idx
-            content = (
-                item.chunk.content_snippet
-                if item.chunk
-                else item.document.body
-            )
-            if content:
-                self.record_read_content(content)
+    def replace(match: re.Match) -> str:
+        url = match.group(0)
+        # Allow exact matches or URLs that share a prefix with an allowed URL.
+        if url in allowed_urls:
+            return url
+        for allowed in allowed_urls:
+            if url.startswith(allowed) or allowed.startswith(url):
+                return url
+        return ""
 
-    def add_grep_hits(self, hits: list[dict], query_terms: list[str]) -> None:
-        """Convert grep hits into unified evidence and register them."""
-        self.add(grep_hits_to_search_results(hits, query_terms))
+    return re.sub(r"https?://[^\s<>()，。；：）]+", replace, text)
 
-    def add_read_document(self, document: Document, content: str) -> None:
-        """Mark a document as read and ensure it exists in the evidence list."""
-        key = str(document.path or document.yuque_id)
-        self.read_sources.add(key)
-        self.record_read_content(content)
-        if not document.yuque_id:
-            return
-        # Merge with any existing evidence for the same document.
-        existing_idx = next(
-            (
-                i
-                for i, s in enumerate(self.sources)
-                if s.document.yuque_id == document.yuque_id
-            ),
-            None,
-        )
-        if existing_idx is None:
-            # A document that is read without prior retrieval evidence is
-            # registered, but it does not automatically become reliable just
-            # because it was opened.
-            self.add(
-                [
-                    SearchResult(
-                        source_id=f"R{len(self.sources) + 1}",
-                        document=document,
-                        score=1.0,
-                        chunk=None,
-                        retrieval_methods=("read",),
-                        reliable=False,
-                    )
-                ]
-            )
-        else:
-            existing = self.sources[existing_idx]
-            merged_document = document
-            if len(existing.document.body) > len(document.body):
-                merged_document = existing.document
-            read_chunk = (
-                existing.chunk
-                or ChunkResult(
-                    chunk_id=f"read:{document.yuque_id}",
-                    document_id=document.yuque_id,
-                    title=document.title,
-                    content_snippet=content[:2400],
-                    source_url=document.url,
-                    final_score=existing.score,
-                    retrieval_methods=("read",),
-                    reliable=existing.reliable,
-                    file_path=str(document.path or ""),
-                    slug=document.slug,
-                    namespace=document.namespace,
-                )
-            )
-            self.sources[existing_idx] = SearchResult(
-                source_id=existing.source_id,
-                document=merged_document,
-                score=existing.score,
-                chunk=read_chunk,
-                keyword_score=existing.keyword_score,
-                retrieval_methods=tuple(
-                    dict.fromkeys([*existing.retrieval_methods, "read"])
-                ),
-                reliable=existing.reliable,
-            )
 
-    @property
-    def reliable_count(self) -> int:
-        return sum(1 for s in self.sources if s.reliable)
-
-    @property
-    def matched_count(self) -> int:
-        return len(self.sources)
-
-    @property
-    def read_count(self) -> int:
-        return len(self.read_sources)
+def _extract_used_evidence_ids(text: str) -> list[str]:
+    """Return ordered evidence ids used by the model, e.g. ['E1','E3']."""
+    return list(dict.fromkeys(f"E{m}" for m in re.findall(r"\[E(\d+)]", text)))
 
 
 def _is_pure_no_evidence(text: str) -> bool:
@@ -168,39 +92,109 @@ def _is_pure_no_evidence(text: str) -> bool:
     cleaned = text
     for marker in _NO_EVIDENCE_MARKERS:
         cleaned = cleaned.replace(marker, "")
-    # Drop punctuation and whitespace; if nothing meaningful remains, it is a pure
-    # no-evidence answer.
     cleaned = re.sub(r"[^\w一-鿿]", "", cleaned).strip()
     return not cleaned
 
 
-def append_verified_citations(
-    text: str, sources: list[SearchResult], verified_urls: set[str] | None = None
-) -> str:
-    """Drop a model-generated source section and render only tracked sources."""
+@dataclass
+class SourceTracker:
+    """Tracks candidate sources and concrete evidence excerpts.
 
-    text = re.split(r"\n\s*(?:参考来源|来源)\s*[:：]", text, maxsplit=1)[0].strip()
-    allowed_urls = {result.document.url for result in sources}
-    allowed_urls.update(verified_urls or set())
-    text = re.sub(
-        r"https?://[^\s<>()，。；：]+",
-        lambda match: match.group(0) if match.group(0) in allowed_urls else "",
-        text,
-    )
-    # Do not append a source list to an answer that contains no substantive
-    # information; otherwise keep the sources so the user can inspect the original
-    # documents.
-    if _is_pure_no_evidence(text) or not sources:
-        logger.info("NJU agent: suppressing citations for no-evidence answer")
-        return text
-    # Limit citations to the most relevant sources to avoid overwhelming the user.
-    top_sources = sources[:5]
-    citations = "\n".join(
-        f"{number}. 《{result.document.title}》：{result.document.url}"
-        for number, result in enumerate(top_sources, 1)
-    )
-    logger.info("NJU agent: appending %d citations", len(top_sources))
-    return f"{text}\n\n参考来源：\n{citations}"
+    * candidate_sources  -- search/grep results used to locate documents.
+    * evidence_excerpts  -- actual text read by the model (the only thing that
+                            may ground a factual answer).
+    * selected_excerpts  -- excerpts chosen for the final answer prompt.
+    """
+
+    candidate_sources: list[SearchResult] = field(default_factory=list)
+    evidence_excerpts: list[EvidenceExcerpt] = field(default_factory=list)
+    selected_excerpts: list[EvidenceExcerpt] = field(default_factory=list)
+    read_sources: set[str] = field(default_factory=set)
+    verified_urls: set[str] = field(default_factory=set)
+
+    def reset(self) -> None:
+        self.candidate_sources.clear()
+        self.evidence_excerpts.clear()
+        self.selected_excerpts.clear()
+        self.read_sources.clear()
+        self.verified_urls.clear()
+
+    def record_urls(self, content: str) -> None:
+        self.verified_urls.update(re.findall(r"https?://[^\s<>()，。；：]+", content))
+
+    def add_candidates(self, results: list[SearchResult]) -> None:
+        """Register search results as candidates, not as final evidence."""
+        by_id: dict[str, int] = {
+            item.document.yuque_id: i
+            for i, item in enumerate(self.candidate_sources)
+            if item.document.yuque_id
+        }
+        for item in results:
+            content = (
+                item.chunk.content_snippet if item.chunk else item.document.body
+            )
+            if content:
+                self.record_urls(content)
+            if not item.document.yuque_id:
+                self.candidate_sources.append(item)
+                continue
+            idx = by_id.get(item.document.yuque_id)
+            if idx is None:
+                self.candidate_sources.append(item)
+                by_id[item.document.yuque_id] = len(self.candidate_sources) - 1
+            else:
+                existing = self.candidate_sources[idx]
+                if item.score > existing.score:
+                    self.candidate_sources[idx] = item
+                    by_id[item.document.yuque_id] = idx
+
+    def add_grep_hits(self, hits: list[dict], query_terms: list[str]) -> None:
+        """Compatibility shim: grep hits are candidate evidence only."""
+        from .evidence import grep_hits_to_search_results
+
+        self.add_candidates(grep_hits_to_search_results(hits, query_terms))
+
+    def add_read_document(self, document, content: str) -> None:
+        """Record a document read as concrete evidence."""
+        key = str(document.path or document.yuque_id)
+        self.read_sources.add(key)
+        self.record_urls(content)
+        self.add_evidence(
+            evidence_excerpt_from_read(document, content[:2400])
+        )
+
+    def add_evidence(self, excerpt: EvidenceExcerpt) -> EvidenceExcerpt:
+        """Append an evidence excerpt and assign it an internal id."""
+        if not excerpt.evidence_id:
+            excerpt.evidence_id = f"E{len(self.evidence_excerpts) + 1}"
+        self.evidence_excerpts.append(excerpt)
+        self.read_sources.add(excerpt.file_path or excerpt.document_id)
+        self.record_urls(excerpt.content)
+        return excerpt
+
+    def has_negative_evidence(self, question: str) -> bool:
+        """Return True when a highly similar QA entry explicitly says no answer."""
+        norm_q = question.casefold()
+        for excerpt in self.evidence_excerpts:
+            if excerpt.qa_status != "no_answer":
+                continue
+            # Require the negative QA to mention the question subject.
+            if any(marker in excerpt.content.casefold() for marker in _NO_ANSWER_MARKERS):
+                if self._overlap_score(norm_q, excerpt.content) >= 0.3:
+                    return True
+        return False
+
+    @staticmethod
+    def _overlap_score(query_norm: str, text: str) -> float:
+        query_chars = set(query_norm)
+        text_chars = set(text.casefold())
+        if not query_chars:
+            return 0.0
+        return len(query_chars & text_chars) / len(query_chars)
+
+    @property
+    def read_count(self) -> int:
+        return len(self.read_sources)
 
 
 ToolFactory = Callable[[SourceTracker], list[object]]
@@ -208,7 +202,7 @@ ToolLoop = Callable[..., Awaitable[object]]
 
 
 class NjuQaAgent:
-    """Uses AstrBot's native tool-loop agent with optional full-document grounding."""
+    """Two-stage evidence-first Agent."""
 
     def __init__(
         self,
@@ -217,12 +211,14 @@ class NjuQaAgent:
         tool_loop: ToolLoop | None = None,
         docs_root: Path | None = None,
         index: Any = None,
+        diagnostics: bool = False,
     ):
         self.context = context
         self.tools = tools
         self._tool_loop = tool_loop
         self.docs_root = docs_root
         self.index = index
+        self.diagnostics = diagnostics
 
     async def answer(self, event: object, prompt: str) -> str:
         provider_id = await self.context.get_current_chat_provider_id(
@@ -233,248 +229,252 @@ class NjuQaAgent:
             logger.warning("NJU agent: no chat provider configured")
             return NO_PROVIDER
 
+        if _is_small_talk(prompt):
+            return await self._answer_small_talk(event, prompt)
+
         tracker = SourceTracker()
-        rows = self.index.all_documents() if self.index is not None else []
-        evidence_mode = classify_evidence_mode(prompt)
-        logger.info("NJU agent evidence mode: %s", evidence_mode.value)
+        await self._research_phase(event, prompt, tracker)
 
-        if evidence_mode == QueryEvidenceMode.CAMPUS_FACTUAL:
-            if rows and self.retriever is not None:
-                return await self._answer_campus_factual(event, prompt, tracker, rows)
-            # Fallback for environments without a configured retriever (e.g. some
-            # unit tests): let the LLM use tools and apply the same evidence gate.
-            return await self._answer_campus_factual_fallback(
-                event, prompt, tracker, rows
-            )
+        if not tracker.evidence_excerpts:
+            logger.info("NJU agent: no evidence excerpts after research")
+            return NO_EVIDENCE
 
-        # Non-factual small talk: use the LLM directly.
+        if tracker.has_negative_evidence(prompt):
+            logger.info("NJU agent: high-confidence negative evidence found")
+            return NO_EVIDENCE
+
+        self._log_evidence_summary(tracker)
+        return await self._answer_phase(event, prompt, tracker)
+
+    async def _answer_small_talk(self, event: object, prompt: str) -> str:
+        provider_id = await self.context.get_current_chat_provider_id(
+            getattr(event, "unified_msg_origin")
+        )
         try:
             response = await self._run_tool_loop(
                 event=event,
                 chat_provider_id=provider_id,
                 prompt=prompt,
-                system_prompt=AGENT_SYSTEM_PROMPT,
-                tracker=tracker,
+                system_prompt=SMALL_TALK_SYSTEM_PROMPT,
+                tracker=SourceTracker(),
             )
         except Exception:
-            logger.exception("NJU agent tool loop failed")
+            logger.exception("NJU agent small-talk failed")
             return AGENT_ERROR
         text = str(getattr(response, "completion_text", "")).strip()
-        result = append_verified_citations(
-            text, tracker.sources, tracker.verified_urls
-        )
-        logger.info("NJU agent direct answer: length=%d", len(result))
-        return result
+        logger.info("NJU agent small-talk: length=%d", len(text))
+        return text
 
-    async def _answer_campus_factual(
-        self,
-        event: object,
-        prompt: str,
-        tracker: SourceTracker,
-        rows: list[Any],
-    ) -> str:
+    async def _research_phase(
+        self, event: object, prompt: str, tracker: SourceTracker
+    ) -> None:
         provider_id = await self.context.get_current_chat_provider_id(
             getattr(event, "unified_msg_origin")
         )
-        plan = build_retrieval_plan(prompt, rows)
-        logger.info("NJU agent plan: %d subquestions", len(plan))
-
-        executor = RetrievalExecutor(self.retriever, self.index, self.docs_root)
-        exec_result = await executor.execute(plan, tracker)
-        logger.info(
-            "NJU agent executor: sources=%d reliable=%d zero_entity_hits=%d",
-            len(tracker.sources),
-            tracker.reliable_count,
-            len(exec_result.zero_entity_hits),
-        )
-
-        reliable_sources = [s for s in tracker.sources if s.reliable]
-        if not reliable_sources:
-            logger.info("NJU agent: no reliable sources for campus question")
-            return NO_EVIDENCE
-
-        answer_mode = self._classify_answer_mode(exec_result.coverage)
-        if answer_mode == "UNSUPPORTED":
-            logger.info("NJU agent: no direct or background coverage")
-            return NO_EVIDENCE
-
-        supporting_sources = self._collect_supporting_sources(exec_result.coverage)
-        tracker.selected_sources = select_grounding_sources(
-            supporting_sources, max_sources=_MAX_GROUNDING_SOURCES
-        )
-        self._record_selected_documents(tracker)
-        if not tracker.selected_sources:
-            logger.info("NJU agent: no selected grounding sources")
-            return NO_EVIDENCE
-
-        logger.info(
-            "NJU agent grounding: mode=%s selected=%d sources=%d reliable=%d",
-            answer_mode,
-            len(tracker.selected_sources),
-            len(tracker.sources),
-            tracker.reliable_count,
-        )
-
-        system_prompt = f"{AGENT_SYSTEM_PROMPT}\n\n{format_plan(plan)}"
-        grounded_prompt = self._grounded_prompt(
-            prompt, tracker, exec_result.coverage, answer_mode
-        )
-
-        try:
-            response = await self._run_tool_loop(
-                event=event,
-                chat_provider_id=provider_id,
-                prompt=grounded_prompt,
-                system_prompt=system_prompt,
-                tracker=tracker,
-            )
-        except Exception:
-            logger.exception("NJU agent grounded tool loop failed")
-            return AGENT_ERROR
-        text = str(getattr(response, "completion_text", "")).strip()
-        if not tracker.read_sources:
-            logger.info("NJU agent: no documents were read during grounding")
-            return NO_EVIDENCE
-        result = append_verified_citations(
-            text, tracker.selected_sources, tracker.verified_urls
-        )
-        logger.info(
-            "NJU agent grounded answer: length=%d selected=%d reliable=%d",
-            len(result),
-            len(tracker.selected_sources),
-            tracker.reliable_count,
-        )
-        return result
-
-    async def _answer_campus_factual_fallback(
-        self,
-        event: object,
-        prompt: str,
-        tracker: SourceTracker,
-        rows: list[Any],
-    ) -> str:
-        """Tool-loop fallback when no retriever/index is available."""
-        provider_id = await self.context.get_current_chat_provider_id(
-            getattr(event, "unified_msg_origin")
-        )
-        plan = None
-        system_prompt = AGENT_SYSTEM_PROMPT
-        if rows:
-            plan = build_retrieval_plan(prompt, rows)
-            system_prompt = f"{AGENT_SYSTEM_PROMPT}\n\n{format_plan(plan)}"
-
         try:
             response = await self._run_tool_loop(
                 event=event,
                 chat_provider_id=provider_id,
                 prompt=prompt,
-                system_prompt=system_prompt,
+                system_prompt=RESEARCH_SYSTEM_PROMPT,
                 tracker=tracker,
+                max_steps=_MAX_RESEARCH_STEPS,
             )
         except Exception:
-            logger.exception("NJU agent fallback tool loop failed")
-            return AGENT_ERROR
+            logger.exception("NJU agent research phase failed")
+            return
+        # Ignore any natural-language answer produced during research; only the
+        # evidence recorded by the tools matters.
         text = str(getattr(response, "completion_text", "")).strip()
-        logger.info(
-            "NJU agent fallback first response: length=%d sources=%d reliable=%d",
-            len(text),
-            len(tracker.sources),
-            tracker.reliable_count,
-        )
+        if self.diagnostics and text:
+            logger.info("NJU agent research discarded text: %d chars", len(text))
 
-        reliable_sources = [s for s in tracker.sources if s.reliable]
-        if not reliable_sources:
-            logger.info("NJU agent fallback: no reliable sources")
+    def _select_excerpts(
+        self, tracker: SourceTracker, max_excerpts: int = _MAX_EVIDENCE
+    ) -> list[EvidenceExcerpt]:
+        """Choose the best concrete evidence for the answer prompt."""
+        # Prefer direct reads over outlines and navigation summaries.
+        type_order = {"read": 0, "details": 1, "outline": 2, "navigation": 3}
+        scored = sorted(
+            tracker.evidence_excerpts,
+            key=lambda e: (
+                type_order.get(e.evidence_type, 4),
+                -e.score,
+                -len(e.content),
+            ),
+        )
+        return scored[:max_excerpts]
+
+    async def _answer_phase(
+        self, event: object, prompt: str, tracker: SourceTracker
+    ) -> str:
+        provider_id = await self.context.get_current_chat_provider_id(
+            getattr(event, "unified_msg_origin")
+        )
+        excerpts = self._select_excerpts(tracker)
+        tracker.selected_excerpts = excerpts
+
+        if not excerpts:
+            logger.info("NJU agent: no selected excerpts for answer")
             return NO_EVIDENCE
 
-        # Entity-specific subquestions still require DIRECT evidence.
-        if plan is not None:
-            coverage = check_coverage(plan, tracker.sources)
-            for cov in coverage:
-                if cov.need.entity_terms and cov.status != CoverageStatus.DIRECT:
-                    logger.info(
-                        "NJU agent fallback: subquestion %r lacks direct evidence",
-                        cov.need.question,
-                    )
-                    return NO_EVIDENCE
+        grounded_prompt = self._build_answer_prompt(prompt, excerpts)
+        answer_tools = self._answer_tools(tracker)
 
-        tracker.selected_sources = select_grounding_sources(
-            reliable_sources, max_sources=_MAX_GROUNDING_SOURCES
-        )
-        self._record_selected_documents(tracker)
-        response = await self._run_tool_loop(
-            event=event,
-            chat_provider_id=provider_id,
-            prompt=self._grounded_prompt(prompt, tracker),
-            system_prompt=AGENT_SYSTEM_PROMPT,
-            tracker=tracker,
-        )
-        text = str(getattr(response, "completion_text", "")).strip()
-        if not tracker.read_sources:
-            logger.info("NJU agent fallback: no documents read during grounding")
-            return NO_EVIDENCE
-        return append_verified_citations(
-            text, tracker.selected_sources, tracker.verified_urls
-        )
+        for attempt in range(2):
+            try:
+                response = await self._run_tool_loop(
+                    event=event,
+                    chat_provider_id=provider_id,
+                    prompt=grounded_prompt,
+                    system_prompt=ANSWER_SYSTEM_PROMPT,
+                    tracker=tracker,
+                    tools=answer_tools,
+                    max_steps=_MAX_ANSWER_STEPS,
+                )
+            except Exception:
+                logger.exception("NJU agent answer phase failed")
+                return AGENT_ERROR
+            text = str(getattr(response, "completion_text", "")).strip()
+            used_ids = _extract_used_evidence_ids(text)
+            if used_ids or _is_pure_no_evidence(text):
+                break
+            logger.warning(
+                "NJU agent: answer missing evidence markers (attempt %d)", attempt + 1
+            )
+            grounded_prompt = (
+                grounded_prompt
+                + "\n\n注意：你刚才的回答没有使用任何 [E#] 标记。"
+                "请重新回答，并确保每个事实都附带 [E#] 标记。"
+            )
+        else:
+            logger.error("NJU agent: answer still missing evidence markers")
+            return SAFE_FAILURE
 
-    @staticmethod
-    def _classify_answer_mode(coverage: list[CoverageResult]) -> str:
-        """Return DIRECT_ANSWER, PARTIAL_ANSWER, BACKGROUND_ONLY or UNSUPPORTED."""
-        has_direct = any(c.status == CoverageStatus.DIRECT for c in coverage)
-        has_background = any(c.status == CoverageStatus.BACKGROUND for c in coverage)
-        has_unsupported = any(
-            c.status == CoverageStatus.UNSUPPORTED for c in coverage
-        )
-        if has_direct:
-            return "PARTIAL_ANSWER" if has_unsupported else "DIRECT_ANSWER"
-        if has_background:
-            return "BACKGROUND_ONLY"
-        return "UNSUPPORTED"
+        return self._finalize_answer(text, excerpts, tracker.verified_urls)
 
-    @staticmethod
-    def _collect_supporting_sources(
-        coverage: list[CoverageResult],
-    ) -> list[SearchResult]:
-        """Gather reliable sources that back DIRECT or BACKGROUND coverage."""
-        supporting: list[SearchResult] = []
-        seen: set[str] = set()
-        for cov in coverage:
-            if cov.status not in (CoverageStatus.DIRECT, CoverageStatus.BACKGROUND):
-                continue
-            for source in cov.sources:
-                if not getattr(source, "reliable", False):
-                    continue
-                key = source.document.yuque_id or source.document.url or source.document.title
-                if key in seen:
-                    continue
-                seen.add(key)
-                supporting.append(source)
-        return supporting
+    def _build_answer_prompt(
+        self, question: str, excerpts: list[EvidenceExcerpt]
+    ) -> str:
+        parts = [f"请回答原问题：{question}\n"]
+        parts.append("你只能使用下面标记的证据回答问题。")
+        for excerpt in excerpts:
+            loc = ""
+            if excerpt.line_start is not None:
+                end = excerpt.line_end if excerpt.line_end is not None else excerpt.line_start
+                loc = f" 位置：第 {excerpt.line_start}—{end} 行"
+            note = ""
+            if excerpt.historical:
+                note = "（历史资料）"
+            header = (
+                f"[{excerpt.evidence_id}]\n"
+                f"来源：《{excerpt.title}》{loc}{note}\n"
+                f"URL：{excerpt.url or 'n/a'}\n"
+                f"内容：\n{excerpt.content}"
+            )
+            parts.append(header)
+        return "\n\n".join(parts)
 
-    @property
-    def retriever(self) -> Any:
-        """Best-effort retriever discovery from the configured tools.
+    def _answer_tools(self, tracker: SourceTracker) -> list[object]:
+        """Return a minimal tool set for the answer phase.
 
-        The executor needs a :class:`HybridRetriever`; when the Agent was built
-        without one we derive it from ``search_knowledge_base`` tools.
+        The answer model should not search.  We only expose read_doc so it can
+        fetch a bit more context from an already-open document if absolutely
+        necessary.  Any new read is recorded as additional evidence.
         """
-        # Plugins instantiate the Agent before the retriever is attached, so the
-        # retriever is discovered lazily from the tool factory.
-        if hasattr(self, "_retriever") and self._retriever is not None:
-            return self._retriever
-        # Build tools once (without a real tracker) to inspect them.
-        try:
-            dummy_tracker = SourceTracker()
-            tools = self.tools(dummy_tracker)
-            for tool in tools:
-                if getattr(tool, "name", "") == "search_knowledge_base":
-                    retriever = getattr(tool, "retriever", None)
-                    if retriever is not None:
-                        self._retriever = retriever
-                        return retriever
-        except Exception:
-            logger.debug("NJU agent: could not discover retriever from tools")
-        return None
+        all_tools = self.tools(tracker)
+        allowed = {"read_doc"}
+        return [t for t in all_tools if getattr(t, "name", "") in allowed]
+
+    def _finalize_answer(
+        self,
+        text: str,
+        excerpts: list[EvidenceExcerpt],
+        verified_urls: set[str] | None = None,
+    ) -> str:
+        used_ids = _extract_used_evidence_ids(text)
+        seen: set[str] = set()
+        used: list[EvidenceExcerpt] = []
+        for e in excerpts:
+            if e.evidence_id in used_ids and e.evidence_id not in seen:
+                seen.add(e.evidence_id)
+                used.append(e)
+        if not used and not _is_pure_no_evidence(text):
+            logger.warning("NJU agent: no evidence markers in final answer")
+            return SAFE_FAILURE
+
+        # Strip internal markers from the visible answer.
+        visible = re.sub(r"\[E\d+]", "", text).strip()
+        if _is_pure_no_evidence(visible):
+            logger.info("NJU agent: no-evidence answer, suppressing citations")
+            return visible or NO_EVIDENCE
+
+        # Remove any URLs the model hallucinated; keep URLs that appear in the
+        # evidence content or in the cited excerpts.
+        allowed_urls = set(verified_urls or set())
+        allowed_urls.update(e.url for e in used if e.url)
+        visible = _strip_unverified_urls(visible, allowed_urls)
+
+        citations = self._build_citations(used)
+        logger.info(
+            "NJU agent: available=%d used=%d citations=%d",
+            len(excerpts),
+            len(used),
+            len(citations),
+        )
+        if not citations:
+            return visible
+        return f"{visible}\n\n参考来源：\n" + "\n".join(citations)
+
+    def _build_citations(self, used: list[EvidenceExcerpt]) -> list[str]:
+        seen: set[str] = set()
+        citations: list[str] = []
+        for excerpt in sorted(used, key=lambda e: e.evidence_id):
+            key = excerpt.document_id or excerpt.url or excerpt.file_path
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            citations.append(f"{len(citations) + 1}. 《{excerpt.title}》：{excerpt.url or excerpt.file_path}")
+        return citations
+
+    def _log_evidence_summary(self, tracker: SourceTracker) -> None:
+        if not self.diagnostics:
+            return
+        logger.info("NJU evidence summary: candidates=%d excerpts=%d read=%d",
+                    len(tracker.candidate_sources),
+                    len(tracker.evidence_excerpts),
+                    tracker.read_count)
+        for e in tracker.evidence_excerpts:
+            logger.info(
+                "NJU evidence excerpt: id=%s type=%s doc=%s lines=%s:%s chars=%d qa=%s historical=%s",
+                e.evidence_id,
+                e.evidence_type,
+                e.document_id,
+                e.line_start,
+                e.line_end,
+                len(e.content),
+                e.qa_status,
+                e.historical,
+            )
+
+    async def _run_tool_loop(
+        self, *, tracker: SourceTracker, **kwargs: object
+    ) -> object:
+        # Allow callers to override the tool set (e.g. answer phase).
+        if "tools" not in kwargs:
+            kwargs["tools"] = self.tools(tracker)
+
+        if self._tool_loop is not None:
+            return await self._tool_loop(**kwargs)
+
+        from astrbot.core.agent.tool import ToolSet
+
+        # The real AstrBot tool loop does not accept our internal tracker; it is
+        # passed to the tools factory above.
+        kwargs.pop("tracker", None)
+        return await self.context.tool_loop_agent(
+            tools=ToolSet(kwargs.pop("tools")), max_steps=12, tool_call_timeout=60, **kwargs
+        )
 
     def _read_source_body(self, source: SearchResult, limit: int = 8000) -> str:
         """Return full document body when docs_root is configured, else chunk snippet."""
@@ -495,68 +495,3 @@ class NjuQaAgent:
                 if source.chunk
                 else source.document.body[:limit]
             )
-
-    def _record_selected_documents(self, tracker: SourceTracker) -> None:
-        """Mark the already-selected grounding sources as read and extract URLs."""
-        for source in tracker.selected_sources:
-            tracker.read_sources.add(
-                str(source.document.path or source.document.yuque_id)
-            )
-            tracker.record_read_content(self._read_source_body(source))
-
-    def _grounded_prompt(
-        self,
-        question: str,
-        tracker: SourceTracker,
-        coverage: list[CoverageResult] | None = None,
-        answer_mode: str | None = None,
-    ) -> str:
-        sources = tracker.selected_sources
-        materials = "\n\n".join(
-            f"[已读材料 {i}]《{source.document.title}》（{source.document.url}）\n{self._read_source_body(source, limit=8000)}"
-            for i, source in enumerate(sources, 1)
-        )
-
-        coverage_text = ""
-        if coverage:
-            coverage_text = "\n" + format_coverage_report(coverage)
-
-        mode_instructions = {
-            "DIRECT_ANSWER": "所有子问题都有 DIRECT 证据，请直接整理成条理清晰的答案。",
-            "PARTIAL_ANSWER": (
-                "部分子问题只有 DIRECT 证据，其余子问题没有直接证据。"
-                "请明确回答有 DIRECT 证据的部分；对于没有直接证据的子问题，"
-                "直接说明“知识库中暂未找到可靠资料”，不要编造具体事实。"
-            ),
-            "BACKGROUND_ONLY": (
-                "没有针对具体实体的 DIRECT 证据，只有通用背景材料。"
-                "请只根据材料给出通用背景说明，并提醒用户该问题未在知识库中找到针对具体实体的可靠资料。"
-            ),
-        }.get(answer_mode, "")
-
-        return f"""请回答原问题：{question}
-
-{mode_instructions}{coverage_text}
-
-我已为你读取了以下最相关的知识库文档（或片段）。请严格根据这些材料作答：
-- 只回答用户实际询问的事项；用户未指定需要逐校区穷举时，不要主动列出材料未覆盖的校区；材料未提及的校区、流程或建议直接略过；不得自行建议前往其他校区办理，除非材料明确支持。
-- 地点、时间、费用、校区等条件必须与对应材料绑定；不同来源或校区信息不一致时，不得合并成一个统一结论，可分别说明或提示资料存在版本差异。
-- 若材料为历史归档或包含具体年份/截止日期，不要把该截止日期当作当前截止日期；可说明历年操作路径，但提醒以本年度通知为准。
-- 材料中明确提到的具体事项，直接整理成条理清晰的答案；材料中没有提到的具体事项直接略过，不要单独列出“未找到”或“未提及”的事项清单。
-- 如果某个材料明显不足，可以调用 read_doc(file_path) 读取完整文档，但只读取已列出的文档；不要自行输出链接或来源列表，系统会自动附加。
-
-{materials}"""
-
-    async def _run_tool_loop(
-        self, *, tracker: SourceTracker, **kwargs: object
-    ) -> object:
-        tools = self.tools(tracker)
-        if self._tool_loop is not None:
-            return await self._tool_loop(tools=tools, **kwargs)
-
-        # Imported lazily so core tests do not require a full AstrBot installation.
-        from astrbot.core.agent.tool import ToolSet
-
-        return await self.context.tool_loop_agent(
-            tools=ToolSet(tools), max_steps=12, tool_call_timeout=60, **kwargs
-        )

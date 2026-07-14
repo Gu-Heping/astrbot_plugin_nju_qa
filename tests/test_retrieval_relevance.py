@@ -1,10 +1,9 @@
-"""Retrieval relevance, source selection, and citation consistency tests."""
+"""Retrieval relevance, query intent, and evidence classification tests."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from nju_qa.agent import NjuQaAgent, SourceTracker, append_verified_citations
 from nju_qa.evidence import (
     QueryIntentTerms,
     classify_qa_window,
@@ -13,10 +12,8 @@ from nju_qa.evidence import (
     is_historical_document,
     parse_query_terms,
     score_grep_hit,
-    select_grounding_sources,
     subject_action_relevance,
 )
-from nju_qa.models import Document, SearchResult
 
 
 def _doc_hit(
@@ -39,29 +36,6 @@ def _doc_hit(
         "matched_keywords": matched_keywords,
         "matches": [{"line_start": 1, "line_end": 1, "snippet": snippet}],
     }
-
-
-def _make_result(
-    title: str,
-    yuque_id: str,
-    score: float,
-    reliable: bool,
-    body: str = "body",
-) -> SearchResult:
-    path = f"{yuque_id}.md"
-    doc = Document(
-        yuque_id=yuque_id,
-        title=title,
-        repository="guide",
-        namespace="nju/guide",
-        slug=Path(path).stem,
-        url=f"https://yuque.test/nju/guide/{Path(path).stem}",
-        created_at="a",
-        updated_at="b",
-        body=body,
-        path=Path(path),
-    )
-    return SearchResult(f"S{yuque_id}", doc, score, reliable=reliable)
 
 
 # ---------------------------------------------------------------------------
@@ -217,53 +191,6 @@ def test_competing_object_docs_score_lower_than_direct():
 
 
 # ---------------------------------------------------------------------------
-# Grounding and citations
-# ---------------------------------------------------------------------------
-
-
-def test_grounding_selects_only_reliable_sources():
-    sources = [
-        _make_result("Unreliable A", "u1", 0.9, False),
-        _make_result("Reliable B", "r1", 0.6, True),
-        _make_result("Reliable C", "r2", 0.5, True),
-        _make_result("Unreliable D", "u2", 0.4, False),
-    ]
-    selected = select_grounding_sources(sources, max_sources=7)
-    assert len(selected) == 2
-    assert selected[0].document.yuque_id == "r1"
-    assert selected[1].document.yuque_id == "r2"
-    assert all(s.reliable for s in selected)
-
-
-def test_grounding_and_citations_use_same_selected_sources():
-    tracker = SourceTracker()
-    tracker.sources = [
-        _make_result("Selected 1", "s1", 0.9, True, body="content one"),
-        _make_result("Selected 2", "s2", 0.7, True, body="content two"),
-        _make_result("Not selected", "ns", 0.5, False, body="content three"),
-    ]
-    tracker.selected_sources = select_grounding_sources(tracker.sources, max_sources=5)
-
-    agent = NjuQaAgent(object(), lambda t: [], None, docs_root=None)
-    prompt = agent._grounded_prompt("校园卡在哪补办？", tracker)
-
-    # Prompt contains only selected sources.
-    assert "Selected 1" in prompt
-    assert "Selected 2" in prompt
-    assert "Not selected" not in prompt
-
-    # Citations contain exactly the same selected sources in the same order.
-    text = "回答。https://yuque.test/nju/guide/ns 这是不该出现的链接。"
-    answer = append_verified_citations(text, tracker.selected_sources, tracker.verified_urls)
-    assert "Selected 1" in answer
-    assert "Selected 2" in answer
-    assert "Not selected" not in answer
-    assert "ns" not in answer
-    lines = [ln for ln in answer.splitlines() if ln.strip().split(".")[0].isdigit()]
-    assert len(lines) == 2
-
-
-# ---------------------------------------------------------------------------
 # QA status classification
 # ---------------------------------------------------------------------------
 
@@ -340,33 +267,3 @@ def test_historical_title_is_detected_and_penalised():
 
 def test_archive_path_is_historical():
     assert is_historical_document("旧文档", "归档/old.md")[0] is True
-
-
-# ---------------------------------------------------------------------------
-# Grounded prompt guardrails
-# ---------------------------------------------------------------------------
-
-
-def test_grounded_prompt_forbids_unasked_campus_expansion():
-    tracker = SourceTracker()
-    tracker.sources = [
-        _make_result("仙林指南", "xl", 0.9, True, body="仙林校区大厅。"),
-    ]
-    tracker.selected_sources = select_grounding_sources(tracker.sources, max_sources=5)
-    agent = NjuQaAgent(object(), lambda t: [], None, docs_root=None)
-    prompt = agent._grounded_prompt("校园卡在哪补办？", tracker)
-    assert "不要主动列出材料未覆盖的校区" in prompt
-    assert "不得自行建议前往其他校区办理" in prompt
-
-
-def test_grounded_prompt_forbids_merging_inconsistent_campus_info():
-    tracker = SourceTracker()
-    tracker.sources = [
-        _make_result("仙林时间", "xl", 0.9, True, body="仙林 8:30-17:00。"),
-        _make_result("鼓楼时间", "gl", 0.8, True, body="鼓楼 9:00-17:00。"),
-    ]
-    tracker.selected_sources = select_grounding_sources(tracker.sources, max_sources=5)
-    agent = NjuQaAgent(object(), lambda t: [], None, docs_root=None)
-    prompt = agent._grounded_prompt("校园卡办公时间？", tracker)
-    assert "不得合并成一个统一结论" in prompt
-    assert "校区" in prompt
