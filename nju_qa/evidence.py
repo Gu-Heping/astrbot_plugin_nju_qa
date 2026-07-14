@@ -27,6 +27,171 @@ class EvidenceExcerpt:
     qa_status: str | None = None
     historical: bool = False
     score: float = 0.0
+    # Deterministic version / applicability metadata.
+    applicable_years: list[int] | None = None
+    applicable_cohorts: list[str] | None = None
+    document_year: int | None = None
+    version_status: str | None = None
+    historical_reason: str | None = None
+
+
+def _extract_years(text: str) -> list[int]:
+    """Return sorted unique 4-digit years (2000-2099) found in ``text``."""
+    years = {int(m) for m in re.findall(r"20\d{2}", text)}
+    return sorted(years)
+
+
+def _extract_cohorts(text: str) -> list[str]:
+    """Return cohort markers like ``2024级`` or ``2023届`` found in ``text``."""
+    markers: list[str] = []
+    for m in re.finditer(r"20\d{2}\s*(?:级|届|学年)", text):
+        markers.append(re.sub(r"\s+", "", m.group(0)))
+    return sorted(set(markers))
+
+
+def _extract_year_range(text: str) -> list[int]:
+    """Expand explicit ranges such as ``2024-2025`` into individual years."""
+    years: set[int] = set()
+    for start_str, end_str in re.findall(r"(20\d{2})\s*[-~]\s*(20\d{2})", text):
+        start, end = int(start_str), int(end_str)
+        if end >= start and end - start <= 10:
+            years.update(range(start, end + 1))
+    return sorted(years)
+
+
+def extract_applicable_years(text: str) -> list[int]:
+    """Return all years that the text explicitly applies to."""
+    return sorted(set(_extract_years(text)) | set(_extract_year_range(text)))
+
+
+def extract_applicable_cohorts(text: str) -> list[str]:
+    """Return cohort markers that the text explicitly applies to."""
+    return _extract_cohorts(text)
+
+
+def extract_document_year(title: str, path: str | None = None) -> int | None:
+    """Return the single document-level year from title/path, if unambiguous."""
+    years = _extract_years(title)
+    if not years and path:
+        years = _extract_years(path)
+    return years[0] if years else None
+
+
+def classify_version_status(
+    title: str,
+    path: str | None,
+    content: str,
+    applicable_years: list[int] | None,
+    document_year: int | None,
+) -> tuple[str, str | None]:
+    """Return deterministic (version_status, historical_reason).
+
+    Status values: ``current``, ``historical``, ``archived``, ``unknown``.
+    """
+    title_low = _normalize(title)
+    path_low = _normalize(path or "")
+    content_low = _normalize(content)
+
+    if "归档" in path_low or "归档" in title_low:
+        return "archived", "路径/标题包含“归档”"
+
+    historical_markers = ("旧版", "历史", "往年", "archive", "未更新", "废止", "失效")
+    for marker in historical_markers:
+        if marker in title_low or marker in path_low or marker in content_low:
+            return "historical", f"文本包含“{marker}”"
+
+    if document_year is not None:
+        # A concrete past year in the title is treated as historical unless the
+        # content explicitly claims it is current/最新/现行.
+        current_markers = ("最新", "现行", "当前", "本年", "今年")
+        if any(m in title_low or m in content_low for m in current_markers):
+            return "current", None
+        return "historical", f"文档标题/路径包含年份 {document_year}"
+
+    if applicable_years:
+        return "historical", f"正文包含适用年份 {applicable_years[0]}"
+
+    return "current", None
+
+
+def _populate_version_metadata(
+    excerpt: EvidenceExcerpt,
+    title: str,
+    path: str | None,
+    content: str,
+) -> None:
+    """Fill version/applicability fields on an excerpt in place."""
+    excerpt.applicable_years = extract_applicable_years(content)
+    excerpt.applicable_cohorts = extract_applicable_cohorts(content)
+    excerpt.document_year = extract_document_year(title, path)
+    excerpt.version_status, excerpt.historical_reason = classify_version_status(
+        title,
+        path,
+        content,
+        excerpt.applicable_years,
+        excerpt.document_year,
+    )
+
+
+def split_qa_blocks(content: str) -> list[str]:
+    """Split a QA-style document into independent blocks.
+
+    Normal articles are returned as a single block unless they contain QA
+    status markers, so headings alone do not fragment the evidence.
+    """
+    blocks = [b.strip() for b in _QA_SEPARATORS.split(content) if b.strip()]
+    if not blocks:
+        return [content.strip()]
+    if len(blocks) == 1:
+        return blocks
+    # Only treat as a splittable QA document when at least one block carries a
+    # status marker.  This prevents ordinary guides from being split by headings.
+    has_status = any(
+        classify_qa_window(b) is not QaEvidenceStatus.UNKNOWN for b in blocks
+    )
+    if not has_status:
+        return [content.strip()]
+    return blocks
+
+
+def evidence_excerpts_from_read(
+    document: Document,
+    content: str,
+    *,
+    line_start: int | None = None,
+    line_end: int | None = None,
+    evidence_type: str = "read",
+    score: float = 0.0,
+) -> list[EvidenceExcerpt]:
+    """Build EvidenceExcerpt(s) from a document read operation.
+
+    QA documents are split into independent blocks so that ``no_answer`` or
+    ``partially_resolved`` blocks do not pollute resolved ones.
+    """
+    blocks = split_qa_blocks(content)
+    excerpts: list[EvidenceExcerpt] = []
+    for block in blocks:
+        historical, _ = is_historical_document(
+            document.title, str(document.path or "")
+        )
+        excerpt = EvidenceExcerpt(
+            document_id=document.yuque_id,
+            title=document.title,
+            url=document.url,
+            file_path=str(document.path or ""),
+            line_start=line_start,
+            line_end=line_end,
+            content=block,
+            evidence_type=evidence_type,
+            qa_status=classify_qa_window(block).value,
+            historical=historical,
+            score=score,
+        )
+        _populate_version_metadata(
+            excerpt, document.title, str(document.path or ""), block
+        )
+        excerpts.append(excerpt)
+    return excerpts
 
 
 def evidence_excerpt_from_read(
@@ -38,23 +203,15 @@ def evidence_excerpt_from_read(
     evidence_type: str = "read",
     score: float = 0.0,
 ) -> EvidenceExcerpt:
-    """Build an EvidenceExcerpt from a document read operation."""
-    historical, _ = is_historical_document(
-        document.title, str(document.path or "")
-    )
-    return EvidenceExcerpt(
-        document_id=document.yuque_id,
-        title=document.title,
-        url=document.url,
-        file_path=str(document.path or ""),
+    """Build a single EvidenceExcerpt from a document read operation."""
+    return evidence_excerpts_from_read(
+        document,
+        content,
         line_start=line_start,
         line_end=line_end,
-        content=content,
         evidence_type=evidence_type,
-        qa_status=classify_qa_window(content).value,
-        historical=historical,
         score=score,
-    )
+    )[0]
 
 
 def evidence_excerpt_from_text(

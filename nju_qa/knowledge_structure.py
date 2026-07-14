@@ -67,6 +67,27 @@ def _row_value(row: Any, key: str, default: Any = "") -> Any:
         return default
 
 
+def normalize_namespace(value: str) -> str:
+    """Return a canonical form of a namespace where ``_`` and ``/`` are equivalent.
+
+    Yuque namespaces look like ``qc19gt/fqpid3`` but are often written as
+    ``qc19gt_fqpid3`` in configuration or filenames.  This helper unifies the
+    two so that structure tools resolve both to the same knowledge base.
+    """
+    return str(value).replace("_", "/").strip("/")
+
+
+def _namespace_matches(
+    segments: list[str], namespace_segments: list[str]
+) -> bool:
+    """Return True when ``segments`` start with the normalized namespace."""
+    if not namespace_segments:
+        return True
+    if len(segments) < len(namespace_segments):
+        return False
+    return segments[: len(namespace_segments)] == namespace_segments
+
+
 def _normalize_path(path: str | Path | None) -> str:
     """Return a POSIX-style string path with leading/trailing slashes removed."""
     if path is None:
@@ -126,14 +147,16 @@ def _build_trie(
     prefix_segments = _path_segments(path_prefix)
     root: dict = {"count": 0, "children": {}, "is_index": False}
 
+    namespace_segments = _path_segments(normalize_namespace(namespace)) if namespace else []
+
     for row in rows:
         rel_path = _normalize_path(_row_value(row, "path"))
         segments = _path_segments(rel_path)
         if not segments:
             continue
 
-        # Namespace filter.  The first segment is treated as the namespace.
-        if namespace and segments[0] != namespace:
+        # Namespace filter.  The first segments are treated as the namespace.
+        if namespace and not _namespace_matches(segments, namespace_segments):
             continue
 
         if not include_archived and _is_archived_path(segments):
@@ -142,7 +165,7 @@ def _build_trie(
         # The path_prefix is interpreted relative to the namespace when a
         # namespace is provided; otherwise it is absolute from the repository
         # root.
-        anchor = 1 if namespace else 0
+        anchor = len(namespace_segments) if namespace else 0
         if not _matches_prefix(segments[anchor:], prefix_segments):
             continue
 
@@ -252,6 +275,15 @@ def build_knowledge_tree(
     return _trie_to_node(trie, name=namespace or "root", path_prefix=path_prefix)
 
 
+def _is_top_level_index_category(name: str) -> bool:
+    """Return True when a category segment is a root index/readme document."""
+    lower = name.lower()
+    stem = Path(name).stem.lower()
+    if stem in {"index", "目录", "toc", "readme"}:
+        return True
+    return lower.startswith("00_")
+
+
 def build_knowledge_base_summaries(
     rows: list[Any],
     *,
@@ -281,6 +313,8 @@ def build_knowledge_base_summaries(
         info["document_count"] += 1
         if len(segments) > 1:
             category = segments[1]
+            if _is_top_level_index_category(category):
+                continue
             info["categories"][category] = info["categories"].get(category, 0) + 1
 
     summaries: list[KnowledgeBaseSummary] = []
@@ -319,6 +353,7 @@ def list_documents_under_prefix(
     A tuple of (documents, has_more).
     """
     prefix_segments = _path_segments(path_prefix)
+    namespace_segments = _path_segments(normalize_namespace(namespace)) if namespace else []
     matching: list[dict] = []
 
     for row in rows:
@@ -326,9 +361,9 @@ def list_documents_under_prefix(
         segments = _path_segments(rel_path)
         if not segments:
             continue
-        if namespace and segments[0] != namespace:
+        if namespace and not _namespace_matches(segments, namespace_segments):
             continue
-        anchor = 1 if namespace else 0
+        anchor = len(namespace_segments) if namespace else 0
         if not _matches_prefix(segments[anchor:], prefix_segments):
             continue
         if not include_archived and _is_archived_path(segments):

@@ -202,7 +202,7 @@ def test_diagnostics_logs_evidence_summary(caplog, tmp_path: Path):
     tracker.add_read_document(doc, "校园卡可在服务中心补办")
 
     with caplog.at_level(logging.INFO, logger="astrbot"):
-        asyncio.run(agent._answer_phase(Event(), "校园卡在哪里补办？", tracker))
+        asyncio.run(agent.answer(Event(), "校园卡在哪里补办？", tracker=tracker))
 
     logs = caplog.text
     assert "NJU evidence summary" in logs

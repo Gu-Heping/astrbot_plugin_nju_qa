@@ -31,12 +31,14 @@ from ..evidence import (
 from ..knowledge_structure import (
     _is_archived_path,
     _matches_prefix,
+    _namespace_matches,
     _normalize_path,
     _path_segments,
     _row_value,
     build_knowledge_base_summaries,
     build_knowledge_tree,
     list_documents_under_prefix,
+    normalize_namespace,
     tree_to_text,
 )
 
@@ -57,6 +59,68 @@ def _expand_query_term(term: str) -> list[str]:
     if term not in expanded:
         expanded.append(term)
     return expanded
+
+
+# Read range preferences.  These limits are intentionally conservative so that
+# the model receives focused context and does not waste tokens on huge ranges.
+_MIN_READ_LINES = 10
+_PREFERRED_READ_LINES = 40
+_MAX_READ_LINES = 80
+_MAX_READ_CHARS = 2400
+
+
+def _clamp_read_range(
+    start_line: int | None,
+    end_line: int | None,
+    total_lines: int,
+) -> tuple[int, int, list[str]]:
+    """Clamp a requested line range to the preferred window.
+
+    Returns ``(start, end, warnings)``.  Ranges above ``_MAX_READ_LINES`` are
+    narrowed; ranges above the preferred size receive a warning but are kept.
+    """
+    start = max(0, start_line or 0)
+    end = total_lines if end_line is None else min(end_line, total_lines)
+    warnings: list[str] = []
+    if end - start > _MAX_READ_LINES:
+        narrowed = start + _PREFERRED_READ_LINES
+        warnings.append(
+            f"请求读取 {start}-{end}（{end - start} 行）超过 {_MAX_READ_LINES} 行，"
+            f"已收窄到 {start}-{narrowed} 行。"
+        )
+        end = narrowed
+    elif end - start > _PREFERRED_READ_LINES:
+        warnings.append(
+            f"请求读取 {start}-{end}（{end - start} 行）较大，建议控制在 "
+            f"{_MIN_READ_LINES}-{_PREFERRED_READ_LINES} 行以内。"
+        )
+    return start, end, warnings
+
+
+def _recompute_line_end(content: str, line_end: int | None) -> int | None:
+    """Return the real last line number after content truncation.
+
+    ``read_document_lines`` prefixes every line with ``N: ``.  We parse that
+    prefix from the final line so that ``line_end`` matches the actual content.
+    """
+    if not content:
+        return line_end
+    last_line = content.rsplit("\n", 1)[-1]
+    match = re.match(r"(\d+):", last_line)
+    if match:
+        return int(match.group(1))
+    return line_end
+
+
+def _truncate_read_result(result: dict, max_chars: int = _MAX_READ_CHARS) -> dict:
+    """Truncate content to ``max_chars`` and update ``end_line`` accordingly."""
+    content = result.get("content", "")
+    if len(content) <= max_chars:
+        return result
+    result["content"] = content[:max_chars]
+    result["end_line"] = _recompute_line_end(result["content"], result.get("end_line"))
+    result["truncated"] = True
+    return result
 
 
 def _row_path_segments(row: Any) -> list[str]:
@@ -81,11 +145,12 @@ def _row_matches_scope(
     if repository and repository.casefold() not in (_row_value(row, "repository")).casefold():
         return False
 
-    if namespace and segments[0] != namespace:
+    namespace_segments = _path_segments(normalize_namespace(namespace)) if namespace else []
+    if namespace and not _matches_prefix(segments, namespace_segments):
         return False
 
     prefix_segments = _path_segments(path_prefix)
-    anchor = 1 if namespace else 0
+    anchor = len(namespace_segments) if namespace else 0
     if not _matches_prefix(segments[anchor:], prefix_segments):
         return False
 
@@ -430,30 +495,40 @@ class ReadDocTool(_Tool):
     ) -> dict:
         try:
             if start_line is not None or end_line is not None:
+                lines = _load_cleaned_document_lines(self.docs_root, file_path)
+                start, end, warnings = _clamp_read_range(
+                    start_line, end_line, len(lines)
+                )
                 result = read_document_lines(
                     self.docs_root,
                     file_path,
-                    start_line=start_line or 0,
-                    end_line=end_line,
+                    start_line=start,
+                    end_line=end,
                     context_lines=context_lines,
                 )
+                if warnings:
+                    result["warnings"] = warnings
             else:
                 result = read_document_content(
                     self.docs_root, file_path, offset, limit
                 )
-        except ValueError as exc:
+        except (OSError, ValueError) as exc:
             return {"error": str(exc), "file_path": file_path}
+
+        result = _truncate_read_result(result)
+
         if self.tracker:
             resolved_path = result.get("file_path", file_path)
             line_start = result.get("start_line")
             line_end = result.get("end_line")
             if getattr(self.tracker, "diagnostics", False):
                 logger.info(
-                    "NJU read_doc: file=%s lines=%s:%s chars=%d",
+                    "NJU read_doc: file=%s lines=%s:%s chars=%d truncated=%s",
                     resolved_path,
                     line_start,
                     line_end,
                     len(result.get("content", "")),
+                    result.get("truncated", False),
                 )
             row = next(
                 (
@@ -615,13 +690,15 @@ class GetDocDetailsTool(_Tool):
                 (r for r in rows if r["path"] == results[0]["path"]),
                 None,
             )
+            # Details reads are also bounded to the evidence context window.
+            content_for_evidence = result.get("content", "")[:_MAX_READ_CHARS]
             if row is not None:
-                document = document_from_index_row(row, result["content"])
-                self.tracker.add_read_document(document, result["content"])
+                document = document_from_index_row(row, content_for_evidence)
+                self.tracker.add_read_document(document, content_for_evidence)
             else:
                 self.tracker.add_evidence(
                     evidence_excerpt_from_text(
-                        content=result["content"][:2400],
+                        content=content_for_evidence,
                         title=results[0].get("title", results[0]["path"]),
                         file_path=results[0]["path"],
                         url=results[0].get("url", ""),
@@ -650,10 +727,15 @@ class ParseYuqueUrlTool(_Tool):
         if not parsed:
             return {"count": 0, "results": []}
         namespace, slug = parsed
+        normalized = normalize_namespace(namespace)
         rows = [
             r
             for r in self.index.find(slug=slug, limit=20)
-            if r["namespace"] == namespace
+            if normalize_namespace(r.get("namespace") or "") == normalized
+            or _namespace_matches(
+                _path_segments(_normalize_path(r.get("path", ""))),
+                _path_segments(normalized),
+            )
         ]
         return {
             "count": len(rows),

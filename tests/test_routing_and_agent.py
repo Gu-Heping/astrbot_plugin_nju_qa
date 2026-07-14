@@ -105,7 +105,7 @@ def test_citations_are_deduplicated_from_actual_evidence():
         ),
         "content",
     )
-    # Adding the same document again should not duplicate read_sources.
+    # Adding the exact same document again should be merged into one excerpt.
     tracker.add_read_document(
         Document(
             "1", "t", "r", "n", "s", "https://yuque.test/doc",
@@ -113,7 +113,7 @@ def test_citations_are_deduplicated_from_actual_evidence():
         ),
         "content",
     )
-    assert len(tracker.evidence_excerpts) == 2
+    assert len(tracker.evidence_excerpts) == 1
     assert len(tracker.read_sources) == 1
 
 

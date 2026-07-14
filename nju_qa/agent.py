@@ -25,8 +25,7 @@ from astrbot.api import logger
 from .doc_utils import read_document_content
 from .evidence import (
     EvidenceExcerpt,
-    _NO_ANSWER_MARKERS,
-    evidence_excerpt_from_read,
+    evidence_excerpts_from_read,
 )
 from .models import SearchResult
 from .prompts import (
@@ -85,6 +84,46 @@ def _strip_unverified_urls(text: str, allowed_urls: set[str]) -> str:
         return ""
 
     return re.sub(r"https?://[^\s<>()，。；：）]+", replace, text)
+
+
+def _evidence_content_key(content: str) -> str:
+    """Return a normalized form of evidence content for deduplication."""
+    lines = content.splitlines()
+    stripped = [re.sub(r"^\s*\d+[:.\s]+", "", line).strip() for line in lines]
+    collapsed = re.sub(r"\s+", " ", " ".join(stripped)).strip()
+    return collapsed.casefold()
+
+
+def _evidence_overlap(a: EvidenceExcerpt, b: EvidenceExcerpt) -> bool:
+    """Return True when two excerpts cover an overlapping line range in the same source."""
+    if a.line_start is None or b.line_start is None:
+        return False
+    a_end = a.line_end if a.line_end is not None else a.line_start
+    b_end = b.line_end if b.line_end is not None else b.line_start
+    return (
+        (a.document_id or a.file_path or a.url)
+        == (b.document_id or b.file_path or b.url)
+        and max(a.line_start, b.line_start) <= min(a_end, b_end)
+    )
+
+
+def _merge_excerpts(existing: EvidenceExcerpt, new: EvidenceExcerpt) -> EvidenceExcerpt:
+    """Merge ``new`` into ``existing`` and return ``existing``."""
+    if existing.line_start is not None and new.line_start is not None:
+        existing.line_start = min(existing.line_start, new.line_start)
+        existing.line_end = max(
+            existing.line_end if existing.line_end is not None else existing.line_start,
+            new.line_end if new.line_end is not None else new.line_start,
+        )
+    if len(new.content) > len(existing.content):
+        existing.content = new.content
+        # Refresh metadata from the richer content.
+        existing.applicable_years = new.applicable_years
+        existing.applicable_cohorts = new.applicable_cohorts
+        existing.document_year = new.document_year
+        existing.version_status = new.version_status
+        existing.historical_reason = new.historical_reason
+    return existing
 
 
 def _extract_used_evidence_ids(text: str) -> list[str]:
@@ -168,46 +207,54 @@ class SourceTracker:
         line_end: int | None = None,
     ) -> None:
         """Record a document read as concrete evidence."""
-        key = str(document.path or document.yuque_id)
-        self.read_sources.add(key)
         self.record_urls(content)
-        self.add_evidence(
-            evidence_excerpt_from_read(
-                document,
-                content[:2400],
-                line_start=line_start,
-                line_end=line_end,
-            )
-        )
+        for excerpt in evidence_excerpts_from_read(
+            document,
+            content[:2400],
+            line_start=line_start,
+            line_end=line_end,
+        ):
+            self.add_evidence(excerpt)
 
     def add_evidence(self, excerpt: EvidenceExcerpt) -> EvidenceExcerpt:
-        """Append an evidence excerpt and assign it an internal id."""
+        """Append an evidence excerpt, deduplicating by source + lines + content.
+
+        Exact duplicates are returned without creating a new excerpt.  Overlapping
+        excerpts for the same source are merged so that nearby reads do not spam
+        the evidence list.
+        """
         if not excerpt.evidence_id:
+            # Reserve a provisional id; it will only be used if the excerpt is kept.
             excerpt.evidence_id = f"E{len(self.evidence_excerpts) + 1}"
+
+        new_key = (
+            excerpt.document_id or excerpt.file_path or excerpt.url,
+            excerpt.line_start,
+            excerpt.line_end,
+            _evidence_content_key(excerpt.content),
+        )
+
+        for existing in self.evidence_excerpts:
+            existing_key = (
+                existing.document_id or existing.file_path or existing.url,
+                existing.line_start,
+                existing.line_end,
+                _evidence_content_key(existing.content),
+            )
+            if existing_key == new_key:
+                return existing
+
+            if _evidence_overlap(existing, excerpt):
+                existing_norm = _evidence_content_key(existing.content)
+                new_norm = _evidence_content_key(excerpt.content)
+                if existing_norm in new_norm or new_norm in existing_norm:
+                    return _merge_excerpts(existing, excerpt)
+
         self.evidence_excerpts.append(excerpt)
-        self.read_sources.add(excerpt.file_path or excerpt.document_id)
+        if excerpt.evidence_type != "navigation":
+            self.read_sources.add(excerpt.file_path or excerpt.document_id)
         self.record_urls(excerpt.content)
         return excerpt
-
-    def has_negative_evidence(self, question: str) -> bool:
-        """Return True when a highly similar QA entry explicitly says no answer."""
-        norm_q = question.casefold()
-        for excerpt in self.evidence_excerpts:
-            if excerpt.qa_status != "no_answer":
-                continue
-            # Require the negative QA to mention the question subject.
-            if any(marker in excerpt.content.casefold() for marker in _NO_ANSWER_MARKERS):
-                if self._overlap_score(norm_q, excerpt.content) >= 0.3:
-                    return True
-        return False
-
-    @staticmethod
-    def _overlap_score(query_norm: str, text: str) -> float:
-        query_chars = set(query_norm)
-        text_chars = set(text.casefold())
-        if not query_chars:
-            return 0.0
-        return len(query_chars & text_chars) / len(query_chars)
 
     @property
     def read_count(self) -> int:
@@ -237,7 +284,12 @@ class NjuQaAgent:
         self.index = index
         self.diagnostics = diagnostics
 
-    async def answer(self, event: object, prompt: str) -> str:
+    async def answer(
+        self,
+        event: object,
+        prompt: str,
+        tracker: SourceTracker | None = None,
+    ) -> str:
         provider_id = await self.context.get_current_chat_provider_id(
             getattr(event, "unified_msg_origin")
         )
@@ -249,7 +301,8 @@ class NjuQaAgent:
         if _is_small_talk(prompt):
             return await self._answer_small_talk(event, prompt)
 
-        tracker = SourceTracker()
+        if tracker is None:
+            tracker = SourceTracker()
         tracker.diagnostics = self.diagnostics
         await self._research_phase(event, prompt, tracker)
 
@@ -331,7 +384,6 @@ class NjuQaAgent:
         provider_id = await self.context.get_current_chat_provider_id(
             getattr(event, "unified_msg_origin")
         )
-        self._log_evidence_summary(tracker)
         excerpts = self._select_excerpts(tracker)
         tracker.selected_excerpts = excerpts
 
@@ -493,7 +545,8 @@ class NjuQaAgent:
             )
         for e in tracker.evidence_excerpts:
             logger.info(
-                "NJU evidence excerpt: id=%s type=%s doc=%s lines=%s:%s chars=%d qa=%s historical=%s",
+                "NJU evidence excerpt: id=%s type=%s doc=%s lines=%s:%s chars=%d "
+                "qa=%s historical=%s years=%s cohorts=%s doc_year=%s version=%s reason=%s",
                 e.evidence_id,
                 e.evidence_type,
                 e.document_id,
@@ -502,6 +555,11 @@ class NjuQaAgent:
                 len(e.content),
                 e.qa_status,
                 e.historical,
+                e.applicable_years,
+                e.applicable_cohorts,
+                e.document_year,
+                e.version_status,
+                e.historical_reason,
             )
 
     async def _run_tool_loop(
