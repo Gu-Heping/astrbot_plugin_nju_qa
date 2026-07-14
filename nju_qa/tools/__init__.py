@@ -2,14 +2,16 @@
 
 from .knowledge import SearchKnowledgeBaseTool
 from .documents import (
-    GrepLocalDocsTool,
-    ReadDocTool,
-    SearchDocsTool,
+    DocStatsTool,
     GetDocDetailsTool,
-    ParseYuqueUrlTool,
+    GetDocOutlineTool,
+    GrepLocalDocsTool,
     ListKnowledgeBasesTool,
     ListRepoDocsTool,
-    DocStatsTool,
+    ListRepoTreeTool,
+    ParseYuqueUrlTool,
+    ReadDocTool,
+    SearchDocsTool,
 )
 
 __all__ = [
@@ -21,5 +23,7 @@ __all__ = [
     "ParseYuqueUrlTool",
     "ListKnowledgeBasesTool",
     "ListRepoDocsTool",
+    "ListRepoTreeTool",
+    "GetDocOutlineTool",
     "DocStatsTool",
 ]

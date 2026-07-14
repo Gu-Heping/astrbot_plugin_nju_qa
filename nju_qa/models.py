@@ -41,6 +41,7 @@ class ChunkResult:
     file_path: str = ""
     slug: str = ""
     namespace: str = ""
+    repository: str = ""
 
 
 @dataclass(frozen=True)

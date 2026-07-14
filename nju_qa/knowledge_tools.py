@@ -9,7 +9,7 @@ from .retriever import HybridRetriever
 
 
 async def search_knowledge_base(
-    retriever: HybridRetriever, tracker: SourceTracker, query: str
+    retriever: HybridRetriever, tracker: SourceTracker, query: str, **scope
 ) -> dict:
     """Search and record source evidence returned to the Agent."""
 
@@ -19,7 +19,7 @@ async def search_knowledge_base(
             "reason": "知识库尚未同步；请管理员先执行 /nju_sync。",
             "candidates": [],
         }
-    results = await retriever.search(query)
+    results = await retriever.search(query, **scope)
     if not results:
         return {
             "reliable": False,

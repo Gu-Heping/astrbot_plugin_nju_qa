@@ -23,11 +23,13 @@ from .nju_qa.routing import MessageRouter, mark_command_handled
 from .nju_qa.sync_service import SyncService
 from .nju_qa.table_renderer import clean_table_images, ensure_cjk_font, render_tables_as_images
 from .nju_qa.tools import (
-    GetDocDetailsTool,
     DocStatsTool,
+    GetDocDetailsTool,
+    GetDocOutlineTool,
     GrepLocalDocsTool,
     ListKnowledgeBasesTool,
     ListRepoDocsTool,
+    ListRepoTreeTool,
     ParseYuqueUrlTool,
     ReadDocTool,
     SearchDocsTool,
@@ -119,11 +121,18 @@ class NjuQaPlugin(Star):
                 ListRepoDocsTool(
                     index=self.index, docs_root=self.store.root, tracker=tracker
                 ),
+                ListRepoTreeTool(
+                    index=self.index, docs_root=self.store.root, tracker=tracker
+                ),
+                GetDocOutlineTool(
+                    index=self.index, docs_root=self.store.root, tracker=tracker
+                ),
                 DocStatsTool(
                     index=self.index, docs_root=self.store.root, tracker=tracker
                 ),
             ],
             docs_root=self.store.root,
+            index=self.index,
         )
         self.router = MessageRouter(
             self.config.wake_words,

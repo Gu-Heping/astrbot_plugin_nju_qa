@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Any
 
 from astrbot.api import logger
 
@@ -16,6 +17,12 @@ from .evidence import (
 )
 from .models import ChunkResult, Document, SearchResult
 from .prompts import AGENT_SYSTEM_PROMPT
+from .retrieval_plan import (
+    CoverageStatus,
+    build_retrieval_plan,
+    check_coverage,
+    format_plan,
+)
 
 
 NO_PROVIDER = "当前未配置 LLM 服务。请联系管理员配置后再试。"
@@ -256,11 +263,13 @@ class NjuQaAgent:
         tools: ToolFactory,
         tool_loop: ToolLoop | None = None,
         docs_root: Path | None = None,
+        index: Any = None,
     ):
         self.context = context
         self.tools = tools
         self._tool_loop = tool_loop
         self.docs_root = docs_root
+        self.index = index
 
     async def answer(self, event: object, prompt: str) -> str:
         provider_id = await self.context.get_current_chat_provider_id(
@@ -272,12 +281,24 @@ class NjuQaAgent:
             return NO_PROVIDER
 
         tracker = SourceTracker()
+        rows = self.index.all_documents() if self.index is not None else []
+        plan = None
+        plan_text = ""
+        if requires_campus_evidence(prompt) and rows:
+            plan = build_retrieval_plan(prompt, rows)
+            plan_text = format_plan(plan) + "\n\n"
+            logger.info("NJU agent plan: %d subquestions", len(plan))
+
+        system_prompt = AGENT_SYSTEM_PROMPT
+        if plan_text:
+            system_prompt = f"{AGENT_SYSTEM_PROMPT}\n\n{plan_text}"
+
         try:
             response = await self._run_tool_loop(
                 event=event,
                 chat_provider_id=provider_id,
                 prompt=prompt,
-                system_prompt=AGENT_SYSTEM_PROMPT,
+                system_prompt=system_prompt,
                 tracker=tracker,
             )
         except Exception:
@@ -307,11 +328,17 @@ class NjuQaAgent:
             logger.info("NJU agent: no reliable sources for campus question")
             return NO_EVIDENCE
 
-        # For campus-factual questions, require reliable sources.
-        reliable_sources = [s for s in tracker.sources if s.reliable]
-        if not reliable_sources:
-            logger.info("NJU agent: no reliable sources for campus question")
-            return NO_EVIDENCE
+        # Evidence coverage: entity-specific subquestions need DIRECT evidence.
+        if plan is not None:
+            coverage = check_coverage(plan, tracker.sources)
+            for cov in coverage:
+                if cov.need.entity_terms and cov.status != CoverageStatus.DIRECT:
+                    logger.info(
+                        "NJU agent: subquestion %r has only %s evidence",
+                        cov.need.question,
+                        cov.status.value,
+                    )
+                    return NO_EVIDENCE
 
         # Ground the answer in the most relevant *reliable* sources.  This
         # selection is reused for the prompt, URL whitelist, and citations.

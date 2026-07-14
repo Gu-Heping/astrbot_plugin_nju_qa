@@ -4,9 +4,17 @@ from __future__ import annotations
 import asyncio
 import httpx
 from pathlib import Path
+from typing import Any
+
 from .config import PluginConfig
 from .document_index import DocumentIndex
 from .keyword_index import ChunkKeywordIndex
+from .knowledge_structure import (
+    _is_archived_path,
+    _matches_prefix,
+    _normalize_path,
+    _path_segments,
+)
 from .models import ChunkResult, Document, SearchResult
 
 
@@ -75,6 +83,57 @@ class HybridRetriever:
             path=Path(row["path"]) if row["path"] else None,
         )
 
+    def _chunk_in_scope(
+        self,
+        chunk: ChunkResult,
+        scope: dict[str, Any],
+        lookup: dict[str, Any],
+    ) -> bool:
+        """Return True when a chunk belongs to the requested retrieval scope."""
+        namespace = scope.get("namespace", "")
+        repository = scope.get("repository", "")
+        path_prefix = scope.get("path_prefix", "")
+        document_ids = scope.get("document_ids")
+        include_archived = scope.get("include_archived", True)
+
+        if document_ids is not None and chunk.document_id not in document_ids:
+            return False
+
+        if namespace:
+            if chunk.namespace != namespace:
+                row = lookup.get(chunk.document_id)
+                if not row or row["namespace"] != namespace:
+                    return False
+
+        if repository:
+            repo = chunk.repository or ""
+            if not repo:
+                row = lookup.get(chunk.document_id)
+                repo = (row["repository"] if row else "") or ""
+            if repository.casefold() not in repo.casefold():
+                return False
+
+        if path_prefix:
+            path = chunk.file_path or ""
+            if not path:
+                row = lookup.get(chunk.document_id)
+                path = row["path"] if row else ""
+            segments = _path_segments(_normalize_path(path))
+            prefix_segments = _path_segments(path_prefix)
+            anchor = 1 if namespace else 0
+            if not _matches_prefix(segments[anchor:], prefix_segments):
+                return False
+
+        if not include_archived:
+            path = chunk.file_path or ""
+            if not path:
+                row = lookup.get(chunk.document_id)
+                path = row["path"] if row else ""
+            if _is_archived_path(_path_segments(_normalize_path(path))):
+                return False
+
+        return True
+
     def _rebuild_keyword_index(self) -> None:
         if self.chunk_store is None:
             return
@@ -141,6 +200,7 @@ class HybridRetriever:
                 file_path=hit.chunk.file_path,
                 slug=hit.chunk.slug,
                 namespace=hit.chunk.namespace,
+                repository=hit.chunk.repository,
             )
             results.append((cr, hit.score))
         return results
@@ -287,7 +347,7 @@ class HybridRetriever:
         merged.sort(key=lambda x: x.final_score, reverse=True)
         return merged
 
-    async def debug_search(self, query: str) -> dict:
+    async def debug_search(self, query: str, **scope) -> dict:
         self._last_error = None
         if self.chunk_store is not None:
             self._rebuild_keyword_index()
@@ -297,6 +357,7 @@ class HybridRetriever:
         )
         merged = self._merge_candidates(vector_hits, keyword_hits)
         normalized = self._normalize(merged)
+        lookup = {r["yuque_id"]: r for r in self.index.all_documents()}
 
         # Mark reliability based on threshold and supporting evidence.
         threshold = self.config.score_threshold
@@ -312,30 +373,40 @@ class HybridRetriever:
                 }
             )
 
-        selected = self._select_from_normalized(normalized, threshold)
+        scoped = {
+            chunk_id: cr
+            for chunk_id, cr in normalized.items()
+            if self._chunk_in_scope(cr, scope, lookup)
+        }
+        selected = self._select_from_normalized(scoped, threshold)
 
         # Fallback: if the hybrid pipeline drops everything, trust pure keyword hits.
         # Keyword hits already have title/path/phrase boosts applied.
         if not selected and keyword_hits:
-            fallback: dict[str, ChunkResult] = {}
-            fallback_threshold = threshold * 0.5
-            for cr, score in keyword_hits:
-                if cr.chunk_id in fallback:
-                    continue
-                fallback[cr.chunk_id] = ChunkResult(
-                    **{
-                        **cr.__dict__,
-                        "keyword_score": score,
-                        "final_score": score,
-                        "retrieval_methods": tuple(
-                            dict.fromkeys([*cr.retrieval_methods, "keyword"])
-                        ),
-                        "reliable": score >= fallback_threshold,
-                    }
-                )
-            selected = self._select_from_normalized(fallback, fallback_threshold)
+            filtered_keyword = [
+                (cr, score)
+                for cr, score in keyword_hits
+                if self._chunk_in_scope(cr, scope, lookup)
+            ]
+            if filtered_keyword:
+                fallback: dict[str, ChunkResult] = {}
+                fallback_threshold = threshold * 0.5
+                for cr, score in filtered_keyword:
+                    if cr.chunk_id in fallback:
+                        continue
+                    fallback[cr.chunk_id] = ChunkResult(
+                        **{
+                            **cr.__dict__,
+                            "keyword_score": score,
+                            "final_score": score,
+                            "retrieval_methods": tuple(
+                                dict.fromkeys([*cr.retrieval_methods, "keyword"])
+                            ),
+                            "reliable": score >= fallback_threshold,
+                        }
+                    )
+                selected = self._select_from_normalized(fallback, fallback_threshold)
 
-        lookup = {r["yuque_id"]: r for r in self.index.all_documents()}
         search_results = []
         for i, item in enumerate(selected):
             row = lookup.get(item.document_id)
@@ -370,6 +441,7 @@ class HybridRetriever:
             "chunk_count": self.chunk_store.chunk_count() if self.chunk_store else 0,
             "vector_count": self.vector_index.count() if self.vector_index else 0,
             "last_error": self._last_error,
+            "scope": scope,
         }
 
     def _select_from_normalized(
@@ -385,8 +457,8 @@ class HybridRetriever:
             item for item in merged_adjacent if item.final_score >= threshold
         ][: self.config.retrieval_top_k]
 
-    async def search(self, query: str) -> list[SearchResult]:
-        report = await self.debug_search(query)
+    async def search(self, query: str, **scope) -> list[SearchResult]:
+        report = await self.debug_search(query, **scope)
         return report["selected"]
 
     def debug_text(self, report: dict) -> str:

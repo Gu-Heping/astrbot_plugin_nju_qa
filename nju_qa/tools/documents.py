@@ -1,10 +1,14 @@
 """Document navigation tools sharing the SQLite/Markdown data contract."""
 
 from __future__ import annotations
+
+import re
 from dataclasses import dataclass, field
 from typing import Any
+
 from astrbot.api import FunctionTool, logger
 from astrbot.api.event import AstrMessageEvent
+
 from ..doc_utils import (
     _load_cleaned_document_lines,
     doc_record_to_public_dict,
@@ -19,6 +23,20 @@ from ..evidence import (
     evaluate_grep_reliability,
     score_grep_hit,
 )
+from ..knowledge_structure import (
+    _is_archived_path,
+    _matches_prefix,
+    _normalize_path,
+    _path_segments,
+    _row_value,
+    build_knowledge_base_summaries,
+    build_knowledge_tree,
+    list_documents_under_prefix,
+    tree_to_text,
+)
+
+
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$")
 
 
 def _expand_query_term(term: str) -> list[str]:
@@ -34,6 +52,55 @@ def _expand_query_term(term: str) -> list[str]:
     if term not in expanded:
         expanded.append(term)
     return expanded
+
+
+def _row_path_segments(row: Any) -> list[str]:
+    """Return path segments for a SQLite document row."""
+    return _path_segments(_normalize_path(_row_value(row, "path")))
+
+
+def _row_matches_scope(
+    row: Any,
+    *,
+    namespace: str = "",
+    path_prefix: str = "",
+    repository: str = "",
+    document_ids: set[str] | None = None,
+    include_archived: bool = True,
+) -> bool:
+    """Return True when a document row matches the requested scope filters."""
+    segments = _row_path_segments(row)
+    if not segments:
+        return False
+
+    if repository and repository.casefold() not in (_row_value(row, "repository")).casefold():
+        return False
+
+    if namespace and segments[0] != namespace:
+        return False
+
+    prefix_segments = _path_segments(path_prefix)
+    anchor = 1 if namespace else 0
+    if not _matches_prefix(segments[anchor:], prefix_segments):
+        return False
+
+    if document_ids is not None and row.get("yuque_id") not in document_ids:
+        return False
+
+    if not include_archived and _is_archived_path(segments):
+        return False
+
+    return True
+
+
+def _parse_document_ids(value: str | list[str] | None) -> set[str] | None:
+    """Convert a string/list parameter into a set of yuque_ids."""
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple, set)):
+        return set(str(v).strip() for v in value if str(v).strip())
+    ids = [v.strip() for v in re.split(r"[,\s]+", str(value)) if v.strip()]
+    return set(ids) if ids else None
 
 
 @dataclass
@@ -55,6 +122,7 @@ class GrepLocalDocsTool(_Tool):
     description: str = (
         "按空格分隔的关键词在本地的 Markdown 文档中逐行搜索，返回带行号的匹配片段。"
         "对于具体事实、名称、流程、时间等精确查询，优先使用本工具而不是向量检索。"
+        "支持按知识库命名空间、路径前缀、文档 ID 集合和归档开关进行作用域过滤。"
     )
     parameters: dict = field(
         default_factory=lambda: {
@@ -64,7 +132,28 @@ class GrepLocalDocsTool(_Tool):
                     "type": "string",
                     "description": "空格分隔的 1-4 个核心关键词，尽量用文档中可能出现的词",
                 },
-                "repo_filter": {"type": "string"},
+                "repo_filter": {
+                    "type": "string",
+                    "description": "按 repository 名称过滤（已废弃，建议使用 repository）",
+                },
+                "repository": {"type": "string", "description": "按 repository 名称过滤"},
+                "namespace": {
+                    "type": "string",
+                    "description": "按知识库命名空间过滤（path 的第一段）",
+                },
+                "path_prefix": {
+                    "type": "string",
+                    "description": "按路径前缀过滤（相对 namespace，例如 02_教务与学业/课程与选课）",
+                },
+                "document_ids": {
+                    "type": "string",
+                    "description": "空格或逗号分隔的语雀文档 ID 集合，限制只在这些文档中搜索",
+                },
+                "include_archived": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "是否包含路径中出现“归档”的文档",
+                },
                 "context_lines": {
                     "type": "integer",
                     "default": 2,
@@ -80,12 +169,28 @@ class GrepLocalDocsTool(_Tool):
         self,
         keywords: str,
         repo_filter: str = "",
+        repository: str = "",
+        namespace: str = "",
+        path_prefix: str = "",
+        document_ids: str = "",
+        include_archived: bool = True,
         context_lines: int = 2,
         limit: int = 10,
         **_,
     ) -> dict:
         terms = [x for x in keywords.split() if x]
-        hits = self._search(terms, repo_filter, context_lines, limit)
+        repo = repository or repo_filter
+        ids = _parse_document_ids(document_ids)
+        hits = self._search(
+            terms,
+            repo_filter=repo,
+            namespace=namespace,
+            path_prefix=path_prefix,
+            document_ids=ids,
+            include_archived=include_archived,
+            context_lines=context_lines,
+            limit=limit,
+        )
         # Fallback: long Chinese queries often fail exact substring matching.
         # Split into overlapping 2-character terms (e.g. "确认录取" → "确认 录取").
         if not hits:
@@ -94,7 +199,16 @@ class GrepLocalDocsTool(_Tool):
                 split_terms = [
                     cleaned[i : i + 2] for i in range(0, len(cleaned) - 1, 2)
                 ]
-                hits = self._search(split_terms, repo_filter, context_lines, limit)
+                hits = self._search(
+                    split_terms,
+                    repo_filter=repo,
+                    namespace=namespace,
+                    path_prefix=path_prefix,
+                    document_ids=ids,
+                    include_archived=include_archived,
+                    context_lines=context_lines,
+                    limit=limit,
+                )
         if self.tracker:
             # Re-rank and register as unified evidence.
             hits = sorted(hits, key=lambda h: score_grep_hit(h, terms), reverse=True)
@@ -121,6 +235,10 @@ class GrepLocalDocsTool(_Tool):
         self,
         terms: list[str],
         repo_filter: str,
+        namespace: str,
+        path_prefix: str,
+        document_ids: set[str] | None,
+        include_archived: bool,
         context_lines: int,
         limit: int,
     ) -> list[dict]:
@@ -133,11 +251,17 @@ class GrepLocalDocsTool(_Tool):
         hits: list[dict] = []
         cf = context_lines
         for row in self.index.all_documents():
-            if (
-                repo_filter
-                and repo_filter.casefold() not in row["repository"].casefold()
+            if repo_filter and repo_filter.casefold() not in (row.get("repository") or "").casefold():
+                continue
+            if not _row_matches_scope(
+                row,
+                namespace=namespace,
+                path_prefix=path_prefix,
+                document_ids=document_ids,
+                include_archived=include_archived,
             ):
                 continue
+
             rel_path = row["path"]
             if not rel_path:
                 continue
@@ -296,15 +420,21 @@ class SearchDocsTool(_Tool):
     name: str = "search_docs"
     description: str = (
         "按标题、slug、语雀 ID 或 URL 查询 SQLite 元数据；同名标题会保留全部候选。"
+        "支持按 namespace、repository、path_prefix 和归档开关进行作用域过滤。"
     )
     parameters: dict = field(
         default_factory=lambda: {
             "type": "object",
             "properties": {
-                "query": {"type": "string"},
+                "query": {"type": "string", "description": "标题模糊查询关键字"},
+                "title_query": {"type": "string", "description": "标题模糊查询关键字（与 query 二选一）"},
                 "yuque_id": {"type": "string"},
                 "slug": {"type": "string"},
                 "url": {"type": "string"},
+                "namespace": {"type": "string"},
+                "repository": {"type": "string"},
+                "path_prefix": {"type": "string"},
+                "include_archived": {"type": "boolean", "default": True},
                 "limit": {"type": "integer", "default": 20},
                 "offset": {"type": "integer", "default": 0},
             },
@@ -315,19 +445,48 @@ class SearchDocsTool(_Tool):
     async def _run(
         self,
         query: str = "",
+        title_query: str = "",
         yuque_id: str = "",
         slug: str = "",
         url: str = "",
+        namespace: str = "",
+        repository: str = "",
+        path_prefix: str = "",
+        include_archived: bool = True,
         limit: int = 20,
         offset: int = 0,
         **_,
     ) -> dict:
+        # Fetch a generous candidate set from SQLite then apply scope filters.
         rows = self.index.find(
-            query, yuque_id=yuque_id, slug=slug, url=url, limit=limit, offset=offset
+            query or title_query,
+            yuque_id=yuque_id,
+            slug=slug,
+            url=url,
+            limit=1000,
+            offset=0,
         )
+        filtered = [
+            row
+            for row in rows
+            if _row_matches_scope(
+                row,
+                namespace=namespace,
+                repository=repository,
+                path_prefix=path_prefix,
+                include_archived=include_archived,
+            )
+        ]
+        filtered.sort(key=lambda r: r["updated_at"] or "", reverse=True)
+        start = max(offset, 0)
+        end = start + max(limit, 1)
+        page = filtered[start:end]
         return {
-            "count": len(rows),
-            "results": [doc_record_to_public_dict(row) for row in rows],
+            "count": len(page),
+            "total": len(filtered),
+            "results": [doc_record_to_public_dict(row) for row in page],
+            "has_more": len(filtered) > end,
+            "next_offset": end if len(filtered) > end else None,
         }
 
 
@@ -430,41 +589,266 @@ class ParseYuqueUrlTool(_Tool):
 @dataclass
 class ListKnowledgeBasesTool(_Tool):
     name: str = "list_knowledge_bases"
-    description: str = "列出已同步知识库及文档数量。"
+    description: str = (
+        "列出已同步知识库、repository、文档数量及顶层分类统计。"
+        "保留旧的 documents 字段以兼容已有调用方。"
+    )
     parameters: dict = field(
         default_factory=lambda: {"type": "object", "properties": {}}
     )
 
     async def _run(self, **_) -> dict:
-        groups = {}
-        for row in self.index.all_documents():
-            groups[row["namespace"]] = groups.get(row["namespace"], 0) + 1
-        return {
-            "knowledge_bases": [
-                {"namespace": k, "documents": v} for k, v in groups.items()
-            ]
-        }
+        summaries = build_knowledge_base_summaries(
+            self.index.all_documents(), include_archived=True
+        )
+        knowledge_bases = []
+        for summary in summaries:
+            knowledge_bases.append(
+                {
+                    "namespace": summary.namespace,
+                    "repository": summary.repository,
+                    "document_count": summary.document_count,
+                    "documents": summary.document_count,
+                    "top_level_categories": [
+                        {"name": cat.name, "document_count": cat.document_count}
+                        for cat in summary.top_level_categories
+                    ],
+                }
+            )
+        return {"knowledge_bases": knowledge_bases}
 
 
 @dataclass
 class ListRepoDocsTool(_Tool):
     name: str = "list_repo_docs"
-    description: str = "列出指定知识库的标题、slug 和 file_path。"
+    description: str = (
+        "列出指定知识库作用域下的文档、直接子分类和分页信息。"
+        "path_prefix 相对于 namespace。"
+    )
     parameters: dict = field(
         default_factory=lambda: {
             "type": "object",
-            "properties": {"namespace": {"type": "string"}},
+            "properties": {
+                "namespace": {"type": "string"},
+                "path_prefix": {
+                    "type": "string",
+                    "description": "相对于 namespace 的路径前缀，例如 02_教务与学业/课程与选课",
+                },
+                "title_query": {"type": "string"},
+                "include_archived": {"type": "boolean", "default": False},
+                "include_index": {"type": "boolean", "default": True},
+                "limit": {"type": "integer", "default": 50},
+                "offset": {"type": "integer", "default": 0},
+            },
             "required": ["namespace"],
         }
     )
 
-    async def _run(self, namespace: str, **_) -> dict:
+    async def _run(
+        self,
+        namespace: str,
+        path_prefix: str = "",
+        title_query: str = "",
+        include_archived: bool = False,
+        include_index: bool = True,
+        limit: int = 50,
+        offset: int = 0,
+        **_,
+    ) -> dict:
+        rows = self.index.all_documents()
+        docs, has_more = list_documents_under_prefix(
+            rows,
+            namespace=namespace,
+            path_prefix=path_prefix,
+            title_query=title_query,
+            include_archived=include_archived,
+            include_index=include_index,
+            limit=limit,
+            offset=offset,
+        )
+        tree = build_knowledge_tree(
+            rows,
+            namespace=namespace,
+            path_prefix=path_prefix,
+            max_depth=1,
+            include_archived=include_archived,
+        )
+        categories = [
+            {
+                "name": child.name,
+                "path_prefix": child.path_prefix,
+                "document_count": child.document_count,
+                "is_index": child.is_index,
+            }
+            for child in (tree.children if tree else ())
+        ]
         return {
-            "documents": [
-                doc_record_to_public_dict(r)
-                for r in self.index.all_documents()
-                if r["namespace"] == namespace
-            ]
+            "documents": docs,
+            "categories": categories,
+            "count": len(docs),
+            "has_more": has_more,
+            "next_offset": offset + len(docs) if has_more else None,
+        }
+
+
+@dataclass
+class ListRepoTreeTool(_Tool):
+    name: str = "list_repo_tree"
+    description: str = (
+        "返回指定知识库作用域下的目录树，包括分类名称和文档数量。"
+        "适合在检索前快速了解知识库结构。"
+    )
+    parameters: dict = field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "namespace": {"type": "string"},
+                "path_prefix": {
+                    "type": "string",
+                    "description": "相对于 namespace 的路径前缀",
+                },
+                "max_depth": {
+                    "type": "integer",
+                    "default": 3,
+                    "description": "返回的最大树深度（0 表示不限制）",
+                },
+                "include_archived": {"type": "boolean", "default": False},
+            },
+            "required": ["namespace"],
+        }
+    )
+
+    async def _run(
+        self,
+        namespace: str,
+        path_prefix: str = "",
+        max_depth: int = 3,
+        include_archived: bool = False,
+        **_,
+    ) -> dict:
+        tree = build_knowledge_tree(
+            self.index.all_documents(),
+            namespace=namespace,
+            path_prefix=path_prefix,
+            max_depth=max_depth or 0,
+            include_archived=include_archived,
+        )
+        if tree is None:
+            return {"tree_text": "", "tree": None, "count": 0}
+
+        def node_to_dict(node):
+            return {
+                "name": node.name,
+                "path_prefix": node.path_prefix,
+                "depth": node.depth,
+                "document_count": node.document_count,
+                "is_index": node.is_index,
+                "children": [node_to_dict(child) for child in node.children],
+            }
+
+        return {
+            "tree_text": tree_to_text(tree),
+            "tree": node_to_dict(tree),
+            "count": tree.document_count,
+        }
+
+
+@dataclass
+class GetDocOutlineTool(_Tool):
+    name: str = "get_doc_outline"
+    description: str = (
+        "读取指定文档的章节大纲（Markdown 标题），返回标题层级、起始/结束行号。"
+        "可选按查询词对章节做相关性排序并返回最相关的若干章节。"
+    )
+    parameters: dict = field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "max_depth": {
+                    "type": "integer",
+                    "default": 3,
+                    "description": "最大标题层级（1-6）",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "可选查询词，命中标题或正文的章节会排在前面",
+                },
+                "limit": {"type": "integer", "default": 20},
+            },
+            "required": ["file_path"],
+        }
+    )
+
+    async def _run(
+        self,
+        file_path: str,
+        max_depth: int = 3,
+        query: str = "",
+        limit: int = 20,
+        **_,
+    ) -> dict:
+        try:
+            lines = _load_cleaned_document_lines(self.docs_root, file_path)
+        except (OSError, ValueError) as exc:
+            return {"error": str(exc), "file_path": file_path}
+
+        headings: list[dict] = []
+        for i, line in enumerate(lines):
+            match = _HEADING_RE.match(line)
+            if not match:
+                continue
+            level = len(match.group(1))
+            if level > max(max_depth, 1):
+                continue
+            headings.append(
+                {
+                    "level": level,
+                    "title": match.group(2).strip(),
+                    "line_number": i + 1,
+                }
+            )
+
+        # Determine section boundaries.
+        for idx, heading in enumerate(headings):
+            next_start = (
+                headings[idx + 1]["line_number"]
+                if idx + 1 < len(headings)
+                else len(lines) + 1
+            )
+            heading["end_line"] = next_start - 1
+
+        if query:
+            terms = [t for t in query.split() if t]
+
+            def _relevance(heading: dict) -> int:
+                title_score = sum(
+                    1 for t in terms if t.casefold() in heading["title"].casefold()
+                )
+                body = "\n".join(
+                    lines[heading["line_number"] - 1 : heading["end_line"]]
+                )
+                body_score = sum(
+                    1 for t in terms if t.casefold() in body.casefold()
+                )
+                return title_score * 3 + body_score
+
+            headings.sort(key=_relevance, reverse=True)
+            headings = headings[:limit]
+            # Keep relevance order when a query is provided.
+            return {
+                "file_path": file_path,
+                "title": headings[0]["title"] if headings else "",
+                "section_count": len(headings),
+                "sections": headings,
+            }
+
+        headings.sort(key=lambda h: h["line_number"])
+        return {
+            "file_path": file_path,
+            "title": headings[0]["title"] if headings else "",
+            "section_count": len(headings),
+            "sections": headings,
         }
 
 
