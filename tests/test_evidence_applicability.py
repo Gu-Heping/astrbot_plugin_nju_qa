@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 
 from nju_qa.agent import SourceTracker
@@ -109,7 +110,35 @@ def test_classify_version_status():
         classify_version_status("培养方案", "x.md", "2024级适用", [2024], None)[0]
         == "historical"
     )
-    assert classify_version_status("培养方案", "x.md", "", None, None)[0] == "current"
+    assert classify_version_status("培养方案", "x.md", "", None, None)[0] == "unknown"
+
+
+def test_version_no_accidental_year_in_body():
+    body = "该通知发布于2024年，请同学们留意。"
+    assert extract_applicable_years(body) == []
+    assert extract_applicable_cohorts(body) == []
+    status, reason = classify_version_status("通知", None, body, [], None)
+    assert status == "unknown"
+
+
+def test_version_year_title_not_current_from_body_current_word():
+    body = "当前学生请关注本方案。"
+    status, reason = classify_version_status("2024 培养方案", None, body, [2024], 2024)
+    assert status == "historical"
+
+
+def test_version_explicit_current_phrase_makes_current():
+    body = "本条例为最新版本，适用于全体本科生。"
+    status, reason = classify_version_status("2024 培养方案", None, body, [2024], 2024)
+    assert status == "current"
+
+
+def test_version_unknown_when_no_version_info():
+    status, reason = classify_version_status(
+        "校园卡指南", "guide/card.md", "校园卡可在服务中心补办。", [], None
+    )
+    assert status == "unknown"
+
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +161,38 @@ def test_qa_block_splitting_only_with_status_markers():
     assert len(blocks) == 2
     assert classify_qa_window(blocks[0]) is QaEvidenceStatus.RELIABLE
     assert classify_qa_window(blocks[1]) is QaEvidenceStatus.NO_ANSWER
+
+
+def test_qa_blocks_keep_distinct_line_numbers():
+    qa = (
+        "1: Q1 校园卡如何补办？\n"
+        "2: status: resolved\n"
+        "3: 可在服务中心补办。\n"
+        "4: Q2 宿舍床尺寸\n"
+        "5: status: no_answer_found\n"
+        "6: 暂无可靠资料。"
+    )
+    doc = Document(
+        yuque_id="qa1",
+        title="QA",
+        repository="r",
+        namespace="n",
+        slug="s",
+        url="",
+        created_at="a",
+        updated_at="b",
+        body=qa,
+        path=Path("qa.md"),
+    )
+    excerpts = evidence_excerpts_from_read(doc, qa, line_start=1, line_end=6)
+    assert len(excerpts) == 2
+    resolved = [e for e in excerpts if e.qa_status == "reliable"][0]
+    no_answer = [e for e in excerpts if e.qa_status == "no_answer"][0]
+    assert resolved.line_start == 1
+    assert resolved.line_end == 3
+    assert no_answer.line_start == 4
+    assert no_answer.line_end == 6
+    assert resolved.line_end < no_answer.line_start
 
 
 def test_ordinary_article_not_split_by_headings():
@@ -206,6 +267,35 @@ def test_source_tracker_merge_overlapping_substring():
     assert merged.line_start == 1
     assert merged.line_end == 3
     assert "服务中心" in merged.content
+
+
+def test_source_tracker_merge_partial_overlap_preserves_full_lines():
+    tracker = SourceTracker()
+    a = EvidenceExcerpt(
+        file_path="doc.md",
+        line_start=1,
+        line_end=3,
+        content="1: 开头\n2: 中间\n3: 共享",
+        evidence_type="read",
+    )
+    b = EvidenceExcerpt(
+        file_path="doc.md",
+        line_start=3,
+        line_end=5,
+        content="3: 共享\n4: 继续\n5: 结尾",
+        evidence_type="read",
+    )
+    tracker.add_evidence(a)
+    tracker.add_evidence(b)
+    assert len(tracker.evidence_excerpts) == 1
+    merged = tracker.evidence_excerpts[0]
+    assert merged.line_start == 1
+    assert merged.line_end == 5
+    first_line, last_line = merged.content.splitlines()[0], merged.content.splitlines()[-1]
+    assert "开头" in first_line
+    assert "结尾" in last_line
+    assert "1:" in first_line
+    assert "5:" in last_line
 
 
 def test_source_tracker_keeps_separate_non_overlapping_ranges():
@@ -325,12 +415,27 @@ def test_truncate_read_result():
     result = {"content": "x" * 3000, "end_line": 100}
     out = _truncate_read_result(result)
     assert out["truncated"] is True
-    assert len(out["content"]) == 2400
+    assert len(out["content"]) <= 2400
     assert out["end_line"] is not None
     assert out["end_line"] <= 100
 
     unchanged = {"content": "short", "end_line": 2}
     assert _truncate_read_result(unchanged) == unchanged
+
+
+def test_truncate_read_result_ends_at_full_line():
+    # Build prefixed lines so the result must end on a complete line boundary.
+    lines = [f"{i + 1}: " + "x" * 60 for i in range(60)]
+    content = "\n".join(lines)
+    result = _truncate_read_result({"content": content, "end_line": 60})
+    assert result["truncated"] is True
+    assert len(result["content"]) <= 2400
+    # The cut must land exactly on a newline, not inside a line.
+    assert content[len(result["content"])] == "\n"
+    # The last kept line is a complete prefixed line.
+    last_line = result["content"].rsplit("\n", 1)[-1]
+    assert re.match(r"^\d+: x+", last_line)
+    assert result["end_line"] == int(last_line.split(":", 1)[0])
 
 
 def test_read_doc_tool_clamps_large_line_range(tmp_path: Path):

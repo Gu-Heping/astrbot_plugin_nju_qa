@@ -112,12 +112,44 @@ def _recompute_line_end(content: str, line_end: int | None) -> int | None:
     return line_end
 
 
+def _truncate_content_at_boundary(content: str, max_chars: int) -> str:
+    """Truncate content at the last complete line, sentence, or safe boundary.
+
+    Prefers a full newline so no half line / list item / link is written into
+    evidence.  If no newline fits, fall back to sentence-ending punctuation, then
+    to the last whitespace, and only then to ``max_chars``.
+    """
+    if len(content) <= max_chars:
+        return content
+
+    # 1) Full line boundary: keep content up to the last newline that fits.
+    # If ``max_chars`` already lands exactly at a line end, keep that much.
+    if content[max_chars] == "\n" or max_chars == len(content):
+        return content[:max_chars]
+    last_newline = content.rfind("\n", 0, max_chars)
+    if last_newline > 0:
+        return content[:last_newline]
+
+    # 2) Sentence-ending punctuation.
+    for boundary in ("\n", "。", "！", "？", ".", "!", "?"):
+        idx = content.rfind(boundary, 0, max_chars)
+        if idx > 0:
+            return content[: idx + 1]
+
+    # 3) Last whitespace so we do not split a word/link mid-token.
+    last_space = content.rfind(" ", 0, max_chars)
+    if last_space > 0:
+        return content[:last_space]
+
+    return content[:max_chars]
+
+
 def _truncate_read_result(result: dict, max_chars: int = _MAX_READ_CHARS) -> dict:
     """Truncate content to ``max_chars`` and update ``end_line`` accordingly."""
     content = result.get("content", "")
     if len(content) <= max_chars:
         return result
-    result["content"] = content[:max_chars]
+    result["content"] = _truncate_content_at_boundary(content, max_chars)
     result["end_line"] = _recompute_line_end(result["content"], result.get("end_line"))
     result["truncated"] = True
     return result
@@ -691,7 +723,9 @@ class GetDocDetailsTool(_Tool):
                 None,
             )
             # Details reads are also bounded to the evidence context window.
-            content_for_evidence = result.get("content", "")[:_MAX_READ_CHARS]
+            content_for_evidence = _truncate_content_at_boundary(
+                result.get("content", ""), _MAX_READ_CHARS
+            )
             if row is not None:
                 document = document_from_index_row(row, content_for_evidence)
                 self.tracker.add_read_document(document, content_for_evidence)

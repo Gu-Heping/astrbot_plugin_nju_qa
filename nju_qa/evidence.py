@@ -35,6 +35,22 @@ class EvidenceExcerpt:
     historical_reason: str | None = None
 
 
+_APPLICABILITY_KEYWORDS: frozenset[str] = frozenset({
+    "适用",
+    "面向",
+    "针对",
+    "对象",
+    "培养方案",
+    "教学计划",
+    "方案",
+    "年级",
+    "级学生",
+    "届学生",
+    "学年",
+    "入学",
+})
+
+
 def _extract_years(text: str) -> list[int]:
     """Return sorted unique 4-digit years (2000-2099) found in ``text``."""
     years = {int(m) for m in re.findall(r"20\d{2}", text)}
@@ -49,24 +65,48 @@ def _extract_cohorts(text: str) -> list[str]:
     return sorted(set(markers))
 
 
+def _in_applicability_context(text: str, start: int, length: int) -> bool:
+    """Return True when a year/range sits in an explicit applicability statement."""
+    window = text[max(0, start - 15) : start + length + 15]
+    if any(kw in window for kw in _APPLICABILITY_KEYWORDS):
+        return True
+    # A standalone cohort marker (e.g. ``2024级``) is itself version information.
+    if re.search(r"20\d{2}\s*(?:级|届|学年)", window):
+        return True
+    return False
+
+
 def _extract_year_range(text: str) -> list[int]:
     """Expand explicit ranges such as ``2024-2025`` into individual years."""
     years: set[int] = set()
-    for start_str, end_str in re.findall(r"(20\d{2})\s*[-~]\s*(20\d{2})", text):
-        start, end = int(start_str), int(end_str)
+    for match in re.finditer(r"(20\d{2})\s*[-~]\s*(20\d{2})", text):
+        start, end = int(match.group(1)), int(match.group(2))
         if end >= start and end - start <= 10:
-            years.update(range(start, end + 1))
+            if _in_applicability_context(text, match.start(), len(match.group(0))):
+                years.update(range(start, end + 1))
     return sorted(years)
 
 
 def extract_applicable_years(text: str) -> list[int]:
-    """Return all years that the text explicitly applies to."""
-    return sorted(set(_extract_years(text)) | set(_extract_year_range(text)))
+    """Return years the text explicitly applies to.
+
+    Years that merely appear in ordinary narrative (e.g. ``发布于2024年``) are
+    ignored unless they sit in an applicability statement.
+    """
+    years: set[int] = set(_extract_year_range(text))
+    for match in re.finditer(r"20\d{2}", text):
+        if _in_applicability_context(text, match.start(), 4):
+            years.add(int(match.group(0)))
+    return sorted(years)
 
 
 def extract_applicable_cohorts(text: str) -> list[str]:
     """Return cohort markers that the text explicitly applies to."""
-    return _extract_cohorts(text)
+    markers: list[str] = []
+    for match in re.finditer(r"20\d{2}\s*(?:级|届|学年)", text):
+        if _in_applicability_context(text, match.start(), len(match.group(0))):
+            markers.append(re.sub(r"\s+", "", match.group(0)))
+    return sorted(set(markers))
 
 
 def extract_document_year(title: str, path: str | None = None) -> int | None:
@@ -87,6 +127,8 @@ def classify_version_status(
     """Return deterministic (version_status, historical_reason).
 
     Status values: ``current``, ``historical``, ``archived``, ``unknown``.
+    A year-bearing title is not promoted to ``current`` by incidental words like
+    ``当前`` or ``最新`` in the body; only explicit version claims count.
     """
     title_low = _normalize(title)
     path_low = _normalize(path or "")
@@ -100,18 +142,37 @@ def classify_version_status(
         if marker in title_low or marker in path_low or marker in content_low:
             return "historical", f"文本包含“{marker}”"
 
+    # Explicit claims such as "本条例为最新版本" / "现行有效".
+    explicit_current = any(m in title_low for m in ("最新", "现行", "当前"))
+    current_phrases = (
+        "为最新版本",
+        "为当前版本",
+        "为现行版本",
+        "现行有效",
+        "当前有效",
+        "最新有效",
+        "最新版本",
+        "当前版本",
+        "现行版本",
+    )
+    if any(p in content_low for p in current_phrases):
+        explicit_current = True
+
     if document_year is not None:
-        # A concrete past year in the title is treated as historical unless the
-        # content explicitly claims it is current/最新/现行.
-        current_markers = ("最新", "现行", "当前", "本年", "今年")
-        if any(m in title_low or m in content_low for m in current_markers):
-            return "current", None
-        return "historical", f"文档标题/路径包含年份 {document_year}"
+        return (
+            ("current", None)
+            if explicit_current
+            else ("historical", f"文档标题/路径包含年份 {document_year}")
+        )
 
     if applicable_years:
-        return "historical", f"正文包含适用年份 {applicable_years[0]}"
+        return (
+            ("current", None)
+            if explicit_current
+            else ("historical", f"正文明确适用年份 {applicable_years[0]}")
+        )
 
-    return "current", None
+    return "unknown", None
 
 
 def _populate_version_metadata(
@@ -133,25 +194,75 @@ def _populate_version_metadata(
     )
 
 
+_QA_BLOCK_START_RE = re.compile(
+    r"^(?:#{1,6}\s+|---+\s*|\*\*Q\d+\s+|Q\d+[\s:])", re.IGNORECASE
+)
+
+
+def _split_qa_blocks_with_lines(
+    content: str,
+) -> list[tuple[str, int | None, int | None]]:
+    """Split a QA-style document into blocks and preserve each block's line numbers.
+
+    Lines are expected to carry the ``N: `` prefix written by
+    ``read_document_lines``.  When prefixes are missing, line numbers fall back
+    to ``None``.
+    """
+    raw_lines = content.splitlines()
+    parsed: list[tuple[int | None, str, str]] = []
+    for raw in raw_lines:
+        match = re.match(r"^(\d+):\s?(.*)$", raw)
+        if match:
+            parsed.append((int(match.group(1)), match.group(2), raw))
+        else:
+            parsed.append((None, raw, raw))
+
+    blocks: list[list[tuple[int | None, str, str]]] = []
+    for line_no, text, raw in parsed:
+        if _QA_BLOCK_START_RE.match(text):
+            blocks.append([])
+        if not blocks:
+            blocks.append([])
+        blocks[-1].append((line_no, text, raw))
+
+    if not blocks:
+        start = next((n for n, _, _ in parsed if n is not None), None)
+        end = next((n for n, _, _ in reversed(parsed) if n is not None), None)
+        return [(content.strip(), start, end)]
+
+    # Only treat as a splittable QA document when at least one block carries a
+    # status marker.  Headings alone do not fragment ordinary guides.
+    has_status = any(
+        classify_qa_window("\n".join(t for _, t, _ in block))
+        is not QaEvidenceStatus.UNKNOWN
+        for block in blocks
+    )
+    if len(blocks) == 1 or not has_status:
+        start = next((n for n, _, _ in parsed if n is not None), None)
+        end = next((n for n, _, _ in reversed(parsed) if n is not None), None)
+        return [(content.strip(), start, end)]
+
+    result: list[tuple[str, int | None, int | None]] = []
+    for block in blocks:
+        if not block:
+            continue
+        if not any(t.strip() for _, t, _ in block):
+            continue
+        block_text = "\n".join(raw for _, _, raw in block).strip()
+        nums = [n for n, _, _ in block if n is not None]
+        start = nums[0] if nums else None
+        end = nums[-1] if nums else None
+        result.append((block_text, start, end))
+    return result
+
+
 def split_qa_blocks(content: str) -> list[str]:
     """Split a QA-style document into independent blocks.
 
     Normal articles are returned as a single block unless they contain QA
     status markers, so headings alone do not fragment the evidence.
     """
-    blocks = [b.strip() for b in _QA_SEPARATORS.split(content) if b.strip()]
-    if not blocks:
-        return [content.strip()]
-    if len(blocks) == 1:
-        return blocks
-    # Only treat as a splittable QA document when at least one block carries a
-    # status marker.  This prevents ordinary guides from being split by headings.
-    has_status = any(
-        classify_qa_window(b) is not QaEvidenceStatus.UNKNOWN for b in blocks
-    )
-    if not has_status:
-        return [content.strip()]
-    return blocks
+    return [block for block, _, _ in _split_qa_blocks_with_lines(content)]
 
 
 def evidence_excerpts_from_read(
@@ -166,11 +277,12 @@ def evidence_excerpts_from_read(
     """Build EvidenceExcerpt(s) from a document read operation.
 
     QA documents are split into independent blocks so that ``no_answer`` or
-    ``partially_resolved`` blocks do not pollute resolved ones.
+    ``partially_resolved`` blocks do not pollute resolved ones.  Each block
+    keeps its real line numbers within the original read window.
     """
-    blocks = split_qa_blocks(content)
+    blocks = _split_qa_blocks_with_lines(content)
     excerpts: list[EvidenceExcerpt] = []
-    for block in blocks:
+    for block, block_start, block_end in blocks:
         historical, _ = is_historical_document(
             document.title, str(document.path or "")
         )
@@ -179,8 +291,8 @@ def evidence_excerpts_from_read(
             title=document.title,
             url=document.url,
             file_path=str(document.path or ""),
-            line_start=line_start,
-            line_end=line_end,
+            line_start=block_start if block_start is not None else line_start,
+            line_end=block_end if block_end is not None else line_end,
             content=block,
             evidence_type=evidence_type,
             qa_status=classify_qa_window(block).value,

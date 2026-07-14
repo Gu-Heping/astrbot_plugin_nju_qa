@@ -25,6 +25,7 @@ from astrbot.api import logger
 from .doc_utils import read_document_content
 from .evidence import (
     EvidenceExcerpt,
+    classify_version_status,
     evidence_excerpts_from_read,
 )
 from .models import SearchResult
@@ -107,22 +108,113 @@ def _evidence_overlap(a: EvidenceExcerpt, b: EvidenceExcerpt) -> bool:
     )
 
 
-def _merge_excerpts(existing: EvidenceExcerpt, new: EvidenceExcerpt) -> EvidenceExcerpt:
-    """Merge ``new`` into ``existing`` and return ``existing``."""
-    if existing.line_start is not None and new.line_start is not None:
-        existing.line_start = min(existing.line_start, new.line_start)
-        existing.line_end = max(
-            existing.line_end if existing.line_end is not None else existing.line_start,
-            new.line_end if new.line_end is not None else new.line_start,
+def _merge_excerpt_contents(a: EvidenceExcerpt, b: EvidenceExcerpt) -> str:
+    """Merge two overlapping excerpts by uniting their full lines.
+
+    Lines prefixed with ``N: `` are sorted by line number; other lines keep
+    their original order and are deduplicated.
+    """
+    def _iter(content: str):
+        for line in content.splitlines():
+            match = re.match(r"^(\d+):\s?(.*)$", line)
+            if match:
+                yield int(match.group(1)), line
+            else:
+                yield None, line
+
+    a_items = list(_iter(a.content))
+    b_items = list(_iter(b.content))
+    all_have_numbers = all(n is not None for n, _ in a_items + b_items)
+
+    seen: set[Any] = set()
+    combined: list[tuple[int | None, str]] = []
+    for num, line in a_items + b_items:
+        key = (num, _evidence_content_key(line)) if num is not None else _evidence_content_key(line)
+        if key in seen:
+            continue
+        seen.add(key)
+        combined.append((num, line))
+
+    if all_have_numbers:
+        combined.sort(key=lambda item: (item[0], 0))
+    return "\n".join(line for _, line in combined)
+
+
+def _copy_excerpt_metadata(target: EvidenceExcerpt, source: EvidenceExcerpt) -> None:
+    """Copy content and metadata from ``source`` to ``target`` while keeping id."""
+    target.document_id = source.document_id
+    target.title = source.title
+    target.url = source.url
+    target.file_path = source.file_path
+    target.content = source.content
+    target.evidence_type = source.evidence_type
+    target.qa_status = source.qa_status
+    target.historical = source.historical
+    target.score = source.score
+    target.applicable_years = source.applicable_years
+    target.applicable_cohorts = source.applicable_cohorts
+    target.document_year = source.document_year
+    target.version_status = source.version_status
+    target.historical_reason = source.historical_reason
+
+
+def _merge_excerpts(existing: EvidenceExcerpt, new: EvidenceExcerpt) -> EvidenceExcerpt | None:
+    """Attempt to merge ``new`` into ``existing``.
+
+    Returns the merged ``existing`` when a reliable merge is possible, otherwise
+    ``None`` to signal that both excerpts should be kept.
+    """
+    existing_norm = _evidence_content_key(existing.content)
+    new_norm = _evidence_content_key(new.content)
+
+    if existing_norm in new_norm:
+        # ``new`` truly contains ``existing``: keep the container but reuse the
+        # existing evidence id so citations stay stable.
+        existing.line_start = (
+            new.line_start
+            if new.line_start is not None
+            else existing.line_start
         )
-    if len(new.content) > len(existing.content):
-        existing.content = new.content
-        # Refresh metadata from the richer content.
-        existing.applicable_years = new.applicable_years
-        existing.applicable_cohorts = new.applicable_cohorts
+        existing.line_end = (
+            new.line_end
+            if new.line_end is not None
+            else existing.line_end
+        )
+        _copy_excerpt_metadata(existing, new)
+        return existing
+
+    if new_norm in existing_norm:
+        # ``existing`` already contains ``new``.
+        return existing
+
+    # Partial overlap: merge full lines.  If the line ranges do not actually
+    # share any lines, do not force a merge.
+    if existing.line_start is None or new.line_start is None:
+        return None
+    existing_end = existing.line_end if existing.line_end is not None else existing.line_start
+    new_end = new.line_end if new.line_end is not None else new.line_start
+    if max(existing.line_start, new.line_start) > min(existing_end, new_end):
+        return None
+
+    merged_content = _merge_excerpt_contents(existing, new)
+    existing.content = merged_content
+    existing.line_start = min(existing.line_start, new.line_start)
+    existing.line_end = max(existing_end, new_end)
+    existing.applicable_years = sorted(
+        set((existing.applicable_years or []) + (new.applicable_years or []))
+    ) or None
+    existing.applicable_cohorts = sorted(
+        set((existing.applicable_cohorts or []) + (new.applicable_cohorts or []))
+    ) or None
+    if new.document_year is not None:
         existing.document_year = new.document_year
-        existing.version_status = new.version_status
-        existing.historical_reason = new.historical_reason
+    existing.version_status, existing.historical_reason = classify_version_status(
+        existing.title,
+        existing.file_path or None,
+        existing.content,
+        existing.applicable_years,
+        existing.document_year,
+    )
     return existing
 
 
@@ -245,10 +337,9 @@ class SourceTracker:
                 return existing
 
             if _evidence_overlap(existing, excerpt):
-                existing_norm = _evidence_content_key(existing.content)
-                new_norm = _evidence_content_key(excerpt.content)
-                if existing_norm in new_norm or new_norm in existing_norm:
-                    return _merge_excerpts(existing, excerpt)
+                merged = _merge_excerpts(existing, excerpt)
+                if merged is not None:
+                    return merged
 
         self.evidence_excerpts.append(excerpt)
         if excerpt.evidence_type != "navigation":

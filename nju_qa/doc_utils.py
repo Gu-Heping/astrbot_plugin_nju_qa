@@ -106,16 +106,16 @@ def read_document_lines(
     context_lines: int = 0,
     strip_metadata: bool = True,
 ) -> dict:
-    """Read a local Markdown document by line numbers.
+    """Read a local Markdown document by 1-based line numbers.
 
-    Lines are counted after optional metadata stripping so that line numbers
-    match the text used by the line-level grep tool.
+    ``start_line`` and ``end_line`` use the same 1-based numbering shown by the
+    line-level grep tool.  Lines are counted after optional metadata stripping.
     """
     if start_line < 0:
         raise ValueError("invalid line range")
     lines = _load_cleaned_document_lines(root, file_path, strip_metadata=strip_metadata)
     total_lines = len(lines)
-    start = max(0, start_line)
+    start = max(0, start_line - 1)
     end = total_lines if end_line is None else min(end_line, total_lines)
     if context_lines:
         start = max(0, start - context_lines)
@@ -125,7 +125,7 @@ def read_document_lines(
             "metadata": _load_document_metadata(root, file_path),
             "content": "",
             "total_lines": total_lines,
-            "start_line": start,
+            "start_line": start + 1,
             "end_line": end,
             "has_more": False,
             "file_path": file_path,
@@ -135,7 +135,7 @@ def read_document_lines(
         "metadata": _load_document_metadata(root, file_path),
         "content": content,
         "total_lines": total_lines,
-        "start_line": start,
+        "start_line": start + 1,
         "end_line": end,
         "has_more": end < total_lines,
         "file_path": file_path,
