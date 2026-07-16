@@ -149,9 +149,19 @@ class NjuQaPlugin(Star):
             private_max=self.config.private_rate_limit,
             private_window_seconds=self.config.private_rate_limit_window,
         )
+        self._allowed_group_ids = {
+            str(group_id).strip()
+            for group_id in self.config.group_whitelist
+            if str(group_id).strip()
+        }
         self._sync_task: asyncio.Task | None = None
         self._rebuild_task: asyncio.Task | None = None
         self._log_version()
+        logger.info(
+            "NJU QA group whitelist: enabled=%s groups=%d",
+            self.config.enable_group_whitelist,
+            len(self._allowed_group_ids),
+        )
 
     def _log_version(self) -> None:
         """Log plugin version and current git commit SHA for diagnostics."""
@@ -170,6 +180,30 @@ class NjuQaPlugin(Star):
         except Exception:
             commit = "unknown"
         logger.info("NJU QA plugin v%s (commit %s)", self.VERSION, commit)
+
+    def _is_group_allowed(self, event: AstrMessageEvent) -> bool:
+        """Return True when the event may use the plugin.
+
+        Private chats are always allowed (``enable_private_chat`` controls them
+        separately).  When the group whitelist is disabled, all groups are allowed.
+        """
+        if event.is_private_chat():
+            return True
+        if not self.config.enable_group_whitelist:
+            return True
+        group_id = str(event.get_group_id() or "").strip()
+        return bool(group_id) and group_id in self._allowed_group_ids
+
+    def _deny_unauthorized_group(self, event: AstrMessageEvent) -> bool:
+        """Mark and return True when the current group is not authorized."""
+        if self._is_group_allowed(event):
+            return False
+        if self.config.retrieval_diagnostics:
+            logger.debug(
+                "NJU QA denied unauthorized group: %s", event.get_group_id()
+            )
+        mark_command_handled(event)
+        return True
 
     async def initialize(self):
         self.index.open()
@@ -198,6 +232,8 @@ class NjuQaPlugin(Star):
         # Ignore command messages that are not actually /nju (some AstrBot builds
         # may route all slash commands to every command handler).
         if not re.match(r"^nju(\s+.*)?$", text, re.IGNORECASE):
+            return
+        if self._deny_unauthorized_group(event):
             return
         mark_command_handled(event)
 
@@ -237,6 +273,8 @@ class NjuQaPlugin(Star):
         text = (getattr(event, "message_str", None) or "").strip()
         if not text.lower().startswith("nju_debug"):
             return
+        if self._deny_unauthorized_group(event):
+            return
         mark_command_handled(event)
         source_re = r"^nju\s+source\s+"
         matched = bool(re.match(source_re, text, re.IGNORECASE))
@@ -250,6 +288,8 @@ class NjuQaPlugin(Star):
     async def nju_grep(self, event: AstrMessageEvent, keywords: str = ""):
         text = (getattr(event, "message_str", None) or "").strip()
         if not text.lower().startswith("nju_grep"):
+            return
+        if self._deny_unauthorized_group(event):
             return
         mark_command_handled(event)
         rl_state = self._check_rate_limit(event)
@@ -289,6 +329,8 @@ class NjuQaPlugin(Star):
         text = (getattr(event, "message_str", None) or "").strip()
         if not text.lower().startswith("nju_sync"):
             return
+        if self._deny_unauthorized_group(event):
+            return
         mark_command_handled(event)
         if action.lower() == "status":
             yield self._rich_result(event,self.syncer.status_text())
@@ -306,6 +348,8 @@ class NjuQaPlugin(Star):
     async def nju_index(self, event: AstrMessageEvent, action: str = ""):
         text = (getattr(event, "message_str", None) or "").strip()
         if not text.lower().startswith("nju_index"):
+            return
+        if self._deny_unauthorized_group(event):
             return
         mark_command_handled(event)
         if action.lower() != "rebuild":
@@ -326,6 +370,8 @@ class NjuQaPlugin(Star):
     async def nju_search(self, event: AstrMessageEvent, query: str = ""):
         text = (getattr(event, "message_str", None) or "").strip()
         if not text.lower().startswith("nju_search"):
+            return
+        if self._deny_unauthorized_group(event):
             return
         mark_command_handled(event)
         if not query.strip():
@@ -358,6 +404,8 @@ class NjuQaPlugin(Star):
         if not routed.should_handle or not routed.query:
             return
         mark_command_handled(event)
+        if not self._is_group_allowed(event):
+            return
         async for result in self._answer_question(event, routed.query):
             yield result
 
@@ -506,6 +554,8 @@ class NjuQaPlugin(Star):
 
     async def _answer_question(self, event: AstrMessageEvent, query: str):
         """Shared Q&A entry used by /nju, @-mentions, wake words and private chat."""
+        if not self._is_group_allowed(event):
+            return
         rl_state = self._check_rate_limit(event)
         if rl_state:
             if not rl_state.silent:

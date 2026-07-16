@@ -9,6 +9,16 @@
   "wake_words": {"description": "唤醒词，逗号分隔", "type": "string", "default": "南大助手,南小答,nju"},
   "enable_private_chat": {"description": "私聊响应", "type": "bool", "default": true},
   "enable_group_at": {"description": "群聊 @ 或唤醒词响应", "type": "bool", "default": true},
+  "enable_group_whitelist": {
+    "description": "启用群聊白名单；启用后仅响应白名单内群聊，私聊不受影响。白名单关闭时不限制群聊；白名单开启但列表为空时，所有群聊均不响应。",
+    "type": "bool",
+    "default": false
+  },
+  "group_whitelist": {
+    "description": "允许使用南京大学知识库问答的群 ID 列表。仅当 enable_group_whitelist 为 true 时生效，私聊不受该列表限制。",
+    "type": "list",
+    "default": []
+  },
   "retrieval_top_k": {"description": "检索结果数", "type": "int", "default": 5},
   "score_threshold": {"description": "检索分数阈值", "type": "float", "default": 0.25},
   "chunk_size": {"description": "单个 chunk 目标字符数", "type": "int", "default": 1200},

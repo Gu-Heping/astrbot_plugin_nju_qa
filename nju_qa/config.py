@@ -18,6 +18,8 @@ class PluginConfig:
     wake_words: tuple[str, ...] = ("南大助手", "南小答", "nju")
     enable_private_chat: bool = True
     enable_group_at: bool = True
+    enable_group_whitelist: bool = False
+    group_whitelist: tuple[str, ...] = ()
     retrieval_top_k: int = 5
     score_threshold: float = 0.25
     chunk_size: int = 1200
@@ -57,6 +59,23 @@ class PluginConfig:
         words = raw.get("wake_words", cls.wake_words)
         if isinstance(words, str):
             words = tuple(x.strip() for x in words.split(",") if x.strip())
+
+        whitelist_raw = raw.get("group_whitelist", cls.group_whitelist)
+        if isinstance(whitelist_raw, str):
+            whitelist_items = [x.strip() for x in whitelist_raw.split(",") if x.strip()]
+        elif isinstance(whitelist_raw, (list, tuple)):
+            whitelist_items = list(whitelist_raw)
+        else:
+            whitelist_items = []
+        seen: set[str] = set()
+        whitelist: list[str] = []
+        for item in whitelist_items:
+            gid = str(item).strip()
+            if not gid or gid in seen:
+                continue
+            seen.add(gid)
+            whitelist.append(gid)
+
         top_k = int(raw.get("retrieval_top_k", 5))
         threshold = float(raw.get("score_threshold", 0.25))
         chunk_size = int(raw.get("chunk_size", 1200))
@@ -91,6 +110,8 @@ class PluginConfig:
             tuple(words),
             bool(raw.get("enable_private_chat", True)),
             bool(raw.get("enable_group_at", True)),
+            bool(raw.get("enable_group_whitelist", False)),
+            tuple(whitelist),
             top_k,
             threshold,
             chunk_size,

@@ -54,6 +54,31 @@ def test_safe_paths_markdown_and_duplicates(tmp_path):
         store.remove(Path("C:/outside.md"))
 
 
+@pytest.mark.parametrize(
+    "mapping,expected_enabled,expected_whitelist",
+    [
+        ({}, False, ()),
+        ({"enable_group_whitelist": True}, True, ()),
+        ({"group_whitelist": "a,b,c"}, False, ("a", "b", "c")),
+        ({"group_whitelist": ["a", " b ", "a", "", "c"]}, False, ("a", "b", "c")),
+        ({"group_whitelist": ("x", "y")}, False, ("x", "y")),
+        ({"group_whitelist": "  , a , b ,  a  "}, False, ("a", "b")),
+        ({"group_whitelist": [1, " 2 ", "2"]}, False, ("1", "2")),
+        (
+            {"enable_group_whitelist": True, "group_whitelist": ["g1", "g2"]},
+            True,
+            ("g1", "g2"),
+        ),
+    ],
+)
+def test_group_whitelist_config_parsing(
+    mapping, expected_enabled, expected_whitelist
+):
+    cfg = PluginConfig.from_mapping({**mapping, "yuque_repositories": ["nju/guide"]})
+    assert cfg.enable_group_whitelist is expected_enabled
+    assert cfg.group_whitelist == expected_whitelist
+
+
 def test_config_validation():
     assert (
         PluginConfig.from_mapping({"yuque_repositories": ["nju/guide"]})

@@ -90,7 +90,7 @@ class _FakeEvent:
         self._result = None
 
 
-def _make_plugin(plugin_class, tmp_path, group_limit=2, private_limit=2):
+def _make_plugin(plugin_class, tmp_path, group_limit=2, private_limit=2, **config_overrides):
     class TestPlugin(plugin_class):
         def __init__(self, data_dir, config):
             self.data_dir = data_dir
@@ -105,6 +105,7 @@ def _make_plugin(plugin_class, tmp_path, group_limit=2, private_limit=2):
         "private_rate_limit": private_limit,
         "private_rate_limit_window": 3600,
     }
+    config.update(config_overrides)
     return TestPlugin(tmp_path, config)
 
 
