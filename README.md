@@ -33,7 +33,10 @@ namespace 是语雀文档 URL `https://www.yuque.com/<namespace>/<slug>` 中的 
 | `chunk_size` | 否 | 单个 chunk 目标字符数，默认 `1200`，最小 `200`。 |
 | `chunk_overlap` | 否 | 相邻 chunk 重叠字符数，默认 `180`。 |
 | `wake_words` | 否 | 默认 `南大助手,南小答,nju`。 |
-| `enable_private_chat` / `enable_group_at` | 否 | 私聊、群聊显式触发开关。 |
+| `enable_private_chat` | 否 | 私聊总开关；默认 `true`，关闭后所有私聊入口（包括 `/nju`、`/nju_grep` 等）均静默。 |
+| `enable_group_at` | 否 | 群聊 @ 或唤醒词响应开关。 |
+| `enable_group_whitelist` | 否 | 群聊白名单总开关；默认 `false`，开启后仅响应 `group_whitelist` 中的群聊。 |
+| `group_whitelist` | 否 | 允许的群 ID 列表；`enable_group_whitelist` 开启时生效，为空则拒绝所有群聊。支持逗号分隔字符串或数组，自动 trim 并去重。 |
 | `retrieval_top_k` / `score_threshold` | 否 | 检索数量和阈值。 |
 | `group_rate_limit` | 否 | 群聊每小时最多响应次数，默认 `30`，`0` 表示不限。 |
 | `group_rate_limit_window` | 否 | 群聊限流窗口秒数，默认 `3600`（1 小时）。 |

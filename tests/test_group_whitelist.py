@@ -11,13 +11,14 @@ from nju_qa.tools import GrepLocalDocsTool
 from tests.helpers import _FakeEvent, _collect, _make_plugin
 
 
-def _whitelist_plugin(plugin_class, tmp_path, enabled=True, whitelist=()):
+def _whitelist_plugin(plugin_class, tmp_path, enabled=True, whitelist=(), **kwargs):
     """Create a plugin with the group whitelist configured."""
     return _make_plugin(
         plugin_class,
         tmp_path,
         enable_group_whitelist=enabled,
         group_whitelist=whitelist,
+        **kwargs,
     )
 
 
@@ -432,3 +433,107 @@ def test_unauthorized_group_message_has_no_side_effects(
     assert plugin.agent.calls == []
     assert not plugin.rate_limiter._buckets
     assert event.should_call_llm_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Private-chat disable semantics
+# ---------------------------------------------------------------------------
+
+
+def test_private_chat_disabled_message_is_silent(plugin_class, tmp_path):
+    plugin = _whitelist_plugin(
+        plugin_class, tmp_path, enabled=False, whitelist=[], enable_private_chat=False
+    )
+    event = _private_event("hello")
+    results = asyncio.run(_collect(plugin.on_message(event)))
+
+    assert results == []
+    assert plugin.agent.calls == []
+    assert not plugin.rate_limiter._buckets
+
+
+def test_private_chat_disabled_nju_command_is_silent(plugin_class, tmp_path):
+    plugin = _whitelist_plugin(
+        plugin_class, tmp_path, enabled=False, whitelist=[], enable_private_chat=False
+    )
+    event = _private_event("nju hello")
+    results = asyncio.run(_collect(plugin.nju(event)))
+
+    assert event.stopped is True
+    assert results == []
+    assert plugin.agent.calls == []
+    assert not plugin.rate_limiter._buckets
+
+
+def test_private_chat_disabled_nju_grep_does_not_run(
+    plugin_class, tmp_path, monkeypatch
+):
+    plugin = _whitelist_plugin(
+        plugin_class, tmp_path, enabled=False, whitelist=[], enable_private_chat=False
+    )
+    monkeypatch.setattr(
+        GrepLocalDocsTool, "_run", _raise_if_called("async_GrepLocalDocsTool._run")
+    )
+    event = _private_event("nju_grep 关键词")
+    results = asyncio.run(_collect(plugin.nju_grep(event, keywords="关键词")))
+
+    assert event.stopped is True
+    assert results == []
+    assert plugin.agent.calls == []
+    assert not plugin.rate_limiter._buckets
+
+
+def test_private_chat_disabled_nju_has_no_side_effects(
+    plugin_class, tmp_path, monkeypatch
+):
+    plugin = _whitelist_plugin(
+        plugin_class, tmp_path, enabled=False, whitelist=[], enable_private_chat=False
+    )
+    monkeypatch.setattr(
+        plugin.agent, "answer", _raise_if_called("async_agent.answer")
+    )
+    monkeypatch.setattr(
+        plugin.retriever, "search", _raise_if_called("async_retriever.search")
+    )
+
+    event = _private_event("nju hello")
+    results = asyncio.run(_collect(plugin.nju(event)))
+
+    assert event.stopped is True
+    assert results == []
+    assert plugin.agent.calls == []
+    assert not plugin.rate_limiter._buckets
+
+
+def test_answer_question_directly_stops_unauthorized_event(
+    plugin_class, tmp_path, monkeypatch
+):
+    plugin = _whitelist_plugin(plugin_class, tmp_path, enabled=True, whitelist=["g1"])
+    monkeypatch.setattr(
+        plugin.agent, "answer", _raise_if_called("async_agent.answer")
+    )
+
+    event = _group_event("南大助手 hello", group_id="g2")
+    results = asyncio.run(_collect(plugin._answer_question(event, "hello")))
+
+    assert event.stopped is True
+    assert results == []
+    assert plugin.agent.calls == []
+
+
+def test_answer_question_directly_stops_disabled_private_chat(
+    plugin_class, tmp_path, monkeypatch
+):
+    plugin = _whitelist_plugin(
+        plugin_class, tmp_path, enabled=False, whitelist=[], enable_private_chat=False
+    )
+    monkeypatch.setattr(
+        plugin.agent, "answer", _raise_if_called("async_agent.answer")
+    )
+
+    event = _private_event("hello")
+    results = asyncio.run(_collect(plugin._answer_question(event, "hello")))
+
+    assert event.stopped is True
+    assert results == []
+    assert plugin.agent.calls == []

@@ -13,6 +13,8 @@
 - `read_doc`、`get_doc_details`、`get_doc_outline` 及结构导航工具将结果记录为证据片段。
 - Agent 支持近似名称处理：精确搜索结果不足时提取稳定关键词搜索标题/路径/正文，读取正文验证后仅在证据明确指向同一对象时说明正式名称对应关系。
 - 启动时日志记录插件版本号与当前 git commit SHA。
+- 新增群聊白名单：启用 `enable_group_whitelist` 后仅响应 `group_whitelist` 中的群 ID；白名单列表为空时拒绝所有群聊。
+- `enable_private_chat` 统一控制所有私聊入口，关闭后私聊的 `/nju`、`/nju_grep` 等命令均静默，不调用 Agent、检索或限流。
 
 ### Changed
 
